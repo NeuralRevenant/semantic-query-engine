@@ -1,237 +1,232 @@
 import os
+import json
+import requests
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 
-# FastAPI / Uvicorn
-from fastapi import FastAPI, Body, BackgroundTasks, Depends
+from fastapi import FastAPI, Body
 import uvicorn
+import redis
 
-# OpenAI Client Setup
-from openai import OpenAI
+from opensearchpy import OpenSearch, RequestsHttpConnection
+from opensearchpy.helpers import bulk
 
-OPENAI_API_KEY = os.environ.get(
-    "OPENAI_API_KEY",
-    "",
-)
-EMBED_MODEL = "text-embedding-ada-002"
-LLM_MODEL = "gpt-4o"
-EMBED_DIM = 1536
+# Config Constants
+LLM_MODEL = "mistral:7b"
+EMBED_MODEL = "mistral:7b"
+OLLAMA_API_URL = "http://localhost:11434/api"
+BATCH_SIZE = 128
+CHUNK_SIZE = 1024
+EMBED_DIM = 4096  # Mistral typically yields 4096-d embeddings in Ollama
+
+REDIS_HOST = "localhost"
+REDIS_PORT = 6379
+MAX_QUERY_CACHE = 1000
+CACHE_SIM_THRESHOLD = 0.96  # Cosine similarity threshold for cache lookup
+
+PMC_DIR = "./PMC"
+
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
 
 
+# Redis Cache Functions
+def store_query_in_redis(query_emb: np.ndarray, response: str):
+    # Store the query embedding + response in Redis as JSON
+    emb_list = query_emb.tolist()[0]
+    entry = {"embedding": emb_list, "response": response}
+    redis_client.lpush("query_cache", json.dumps(entry))
+    # Trim to MAX_QUERY_CACHE to maintain only a limited number of entries in the cache
+    redis_client.ltrim("query_cache", 0, MAX_QUERY_CACHE - 1)
+
+
+def find_similar_query_in_redis(query_emb: np.ndarray) -> Optional[str]:
+    """
+    Search the Redis list for an embedding whose similarity to `query_emb`
+    is >= CACHE_SIM_THRESHOLD. If found, return the stored response. Else None.
+    """
+    cached_list = redis_client.lrange("query_cache", 0, MAX_QUERY_CACHE - 1)
+    query_vec = query_emb[0]
+
+    best_sim = -1.0
+    best_response = None
+
+    for c in cached_list:
+        entry = json.loads(c)
+        emb_list = entry["embedding"]
+        cached_emb = np.array(emb_list, dtype=np.float32)
+        sim = cosine_similarity(query_vec, cached_emb)
+        if sim > best_sim:
+            best_sim = sim
+            best_response = entry["response"]
+
+    if best_sim >= CACHE_SIM_THRESHOLD:
+        return best_response
+
+    return None
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    # a, b are 1-D float arrays
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+# Ollama Synchronous Embedding Calls
 def embed_texts(texts: List[str]) -> np.ndarray:
-    # Generate embeddings for a list of texts using OpenAI APIs.
+    """
+    Calls Ollama /api/embeddings for each text individually. Because Mistral in
+    Ollama doesn’t batch multiple texts at once, we loop.
+    """
     if not texts:
         return np.array([])
 
     all_embeddings = []
-    BATCH_SIZE = 1000
+    for text in texts:
+        payload = {"model": EMBED_MODEL, "prompt": text}
+        try:
+            resp = requests.post(
+                f"{OLLAMA_API_URL}/embeddings",
+                json=payload,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            embedding_vec = data.get("embedding", [])
+            # If the model fails or returns nothing, skip the round
+            if not embedding_vec:
+                continue
 
-    try:
-        # Batch-process the chunks of text for embedding generation
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        for i in range(0, len(texts), BATCH_SIZE):
-            batch = texts[i : i + BATCH_SIZE]
-            resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
-            batch_embs = [r.embedding for r in resp.data]
-            all_embeddings.extend(batch_embs)
-    except Exception as e:
-        print(f"[ERROR] Embedding failure: {e}")
-        return np.array([])
+            all_embeddings.append(embedding_vec)
+        except requests.RequestException as e:
+            print(f"[Embedding ERROR] {e}")
+            return np.array([])
 
     return np.array(all_embeddings, dtype=np.float32)
 
 
 def embed_query(query: str) -> np.ndarray:
-    """
-    Embedding for a query string using the same OpenAI embedding model that was used
-    to create document embeddings.
-    Example response: {
-        "object": "list",
-        "data": [
-            {
-                "object": "embedding",
-                "index": 0,
-                "embedding": [
-                    -0.006929283495992422,
-                    -0.005336422007530928,
-                    -4.547132266452536e-05,
-                    -0.024047505110502243
-                ],
-            }
-        ],
-        "model": "text-embedding-3-small",
-        "usage": {
-            "prompt_tokens": 5,
-            "total_tokens": 5
-        }
-    }
-    """
-    if not query:
+    if not query.strip():
         return np.array([])
 
-    try:
-        # Generate Query embeddings
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        resp = client.embeddings.create(model=EMBED_MODEL, input=[query])
-        emb = resp.data[0].embedding
-        return np.array([emb], dtype=np.float32)
-    except Exception as e:
-        print(f"[ERROR] Query embedding failure: {e}")
+    arr = embed_texts([query])
+    if arr.size == 0:
         return np.array([])
+    return arr
 
 
-def call_llm_gpt(prompt: str) -> str:
-    # Call GPT model (gpt-4o or other)
+# Ollama-based LLM Calls (Mistral 7B)
+def call_llm(prompt: str) -> str:
+    """
+    Synchronous call to Mistral 7B via Ollama /api/generate.
+    """
+    payload = {"model": LLM_MODEL, "prompt": prompt, "stream": False}
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        completion = client.chat.completions.create(
-            model=LLM_MODEL,
-            store=False,
-            messages=[
-                {"role": "system", "content": "You are a helpful AI assistant."},
-                {"role": "user", "content": prompt},
-            ],
+        resp = requests.post(
+            f"{OLLAMA_API_URL}/generate",
+            json=payload,
+            timeout=60,
         )
-        return completion.choices[0].message.content.strip()
-    except Exception as e:
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("response", "[LLM ERROR] No response").strip()
+    except requests.RequestException as e:
         return f"[LLM ERROR] {e}"
 
 
-# FAISS (using in-memory store for storing indices on local machine)
-import faiss
+# OpenSearch Setup with HNSW ANN
+OPENSEARCH_HOST = os.environ.get("OPENSEARCH_HOST", "localhost")
+OPENSEARCH_PORT = int(os.environ.get("OPENSEARCH_PORT", 9200))
+OPENSEARCH_INDEX_NAME = "medical-search-index"
 
-
-class FaissIndexer:
-    def __init__(self, dim: int):
-        self.dim = dim
-        self.index = faiss.IndexFlatL2(dim)
-        self.docstore = []
-
-    def add_embeddings(self, embeddings: np.ndarray, docs: List[str]):
-        # Add embeddings to FAISS index
-        if embeddings.size == 0:
-            print("[FaissIndexer] No embeddings to index.")
-            return
-
-        if embeddings.shape[1] != self.dim:
-            raise ValueError(
-                f"[FaissIndexer] Dimension mismatch. Expected {self.dim}, got {embeddings.shape[1]}"
-            )
-
-        self.index.add(embeddings)
-        self.docstore.extend(docs)
-
-    def search(self, query_emb: np.ndarray, k: int = 3) -> List[Tuple[str, float]]:
-        # Search for top k docs via FAISS L2 distance using the embeddings
-        if self.index.ntotal == 0 or query_emb.size == 0:
-            return []
-
-        distances, indices = self.index.search(query_emb, k)
-        results = []
-        for dist, idx in zip(distances[0], indices[0]):
-            if idx < len(self.docstore):
-                text = self.docstore[idx]
-                results.append((text, float(dist)))
-
-        print(f"[FAISSIndexer] Found {len(results)} docs in search.")
-        return results
-
-    def is_empty(self) -> bool:
-        return self.index.ntotal == 0
-
-    def get_all_vectors_and_texts(self) -> Tuple[np.ndarray, List[str]]:
-        """
-        Returns all (embeddings, doc_texts) stored in FAISS in memory.
-        - FAISS stores vectors in an internal structure. We use index.reconstruct(i)
-          to get the i-th vector.
-        - We retrieve all vectors from 0 ... (ntotal-1).
-        - docstore is in sync, so docstore[i] corresponds to the i-th vector.
-
-        it extracts them from the FAISS in-memory store.
-        """
-        total = self.index.ntotal
-        if total == 0:
-            return np.array([]), []
-
-        # Reconstruct each embedding
-        embs = []
-        for i in range(total):
-            vec = self.index.reconstruct(i)  # get the i-th vector/embedding
-            embs.append(vec)
-
-        embs_np = np.array(embs, dtype=np.float32)
-        return embs_np, self.docstore[:]
-
-
-# Elastic Search Setup
-from elasticsearch import Elasticsearch, helpers
-
-ELASTIC_API_KEY = os.environ.get("ELASTIC_API_KEY", "")
-ELASTIC_INDEX_NAME = "medical-search-index"
-
-es_client: Optional[Elasticsearch] = None
+# Attempt to connect to OpenSearch instance
+os_client: Optional[OpenSearch] = None
 try:
-    es_client = Elasticsearch(
-        "https://",
-        api_key=ELASTIC_API_KEY,
+    os_client = OpenSearch(
+        hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
+        http_compress=True,
+        use_ssl=False,
+        verify_certs=False,
+        connection_class=RequestsHttpConnection,
     )
-    if not es_client.ping():
-        raise ValueError("Elasticsearch ping failed - invalid credentials or host.")
+    # Check if cluster is up
+    info = os_client.info()
+    print(f"[INFO] Connected to OpenSearch: {info['version']}")
 
-    if not es_client.indices.exists(index=ELASTIC_INDEX_NAME):
-        resp = es_client.indices.create(
-            index=ELASTIC_INDEX_NAME,
-            mappings={
+    # Create index if doesn't exist
+    if not os_client.indices.exists(OPENSEARCH_INDEX_NAME):
+        index_body = {
+            "settings": {"index": {"knn": True}},
+            "mappings": {
                 "properties": {
+                    "doc_id": {"type": "keyword"},
                     "text": {"type": "text"},
                     "embedding": {
-                        "type": "dense_vector",
-                        "dims": EMBED_DIM,
-                        "similarity": "cosine",
+                        "type": "knn_vector",
+                        "dimension": EMBED_DIM,
+                        "method": {
+                            "name": "hnsw",
+                            "engine": "nmslib",  # nmslib for cosinesimil
+                            "space_type": "cosinesimil",
+                            "parameters": {"m": 16, "ef_construction": 200},
+                        },
                     },
                 }
             },
-        )
-        print(
-            f"[INFO] Created '{ELASTIC_INDEX_NAME}' index with cosine similarity: {resp}"
-        )
+        }
+        resp = os_client.indices.create(index=OPENSEARCH_INDEX_NAME, body=index_body)
+        print(f"[INFO] Created '{OPENSEARCH_INDEX_NAME}' index with HNSW: {resp}")
     else:
-        print(f"[INFO] Elasticsearch index '{ELASTIC_INDEX_NAME}' is ready.")
+        print(f"[INFO] OpenSearch index '{OPENSEARCH_INDEX_NAME}' is ready.")
+
 except Exception as e:
-    print(f"[WARNING] Elasticsearch not initialized: {e}")
-    es_client = None
+    print(f"[WARNING] OpenSearch not initialized: {e}")
+    os_client = None
 
 
-class ElasticsearchIndexer:
-    def __init__(self, es: Elasticsearch, index_name: str):
-        self.es = es
+class OpenSearchIndexer:
+    # Stores documents with 'knn_vector' field in OpenSearch using approximate search (HNSW)
+    def __init__(self, client: OpenSearch, index_name: str):
+        self.client = client
         self.index_name = index_name
 
     def has_any_data(self) -> bool:
         # Returns True if index contains any documents else False.
-        if not self.es:
+        if not self.client:
             return False
         try:
-            resp = self.es.count(index=self.index_name)
+            resp = self.client.count(index=self.index_name)
             return resp["count"] > 0
         except:
             return False
 
-    def add_embeddings(self, embeddings: np.ndarray, docs: List[str]):
-        # Adds doc embeddings into Elasticsearch using bulk() API
-        if not self.es or embeddings.size == 0:
-            print("[ElasticsearchIndexer] No embeddings or Elasticsearch client.")
+    def add_embeddings(self, embeddings: np.ndarray, docs: List[Dict[str, str]]):
+        if not self.client or embeddings.size == 0:
+            print("[OpenSearchIndexer] No embeddings or no OpenSearch client.")
             return
 
-        BATCH_SIZE = 100
         actions = []
-        for i, (doc, emb) in enumerate(zip(docs, embeddings)):
+        # Normalize vectors if using cosine similarity
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        embeddings = embeddings / (norms + 1e-9)
+
+        for i, (doc_dict, emb) in enumerate(zip(docs, embeddings)):
+            doc_id = doc_dict["doc_id"]
+            text_content = doc_dict["text"]
+
             actions.append(
                 {
                     "_op_type": "index",
                     "_index": self.index_name,
-                    "_id": f"doc_{i}",
-                    "_source": {"text": doc, "embedding": emb.tolist()},
+                    "_id": f"{doc_id}_{i}",
+                    "_source": {
+                        "doc_id": doc_id,
+                        "text": text_content,
+                        "embedding": emb.tolist(),
+                    },
                 }
             )
 
@@ -245,89 +240,38 @@ class ElasticsearchIndexer:
 
     def _bulk_index(self, actions):
         try:
-            # Attempt the bulk indexing operation
-            helpers.bulk(self.es, actions)
-            print(f"[ElasticsearchIndexer] Inserted {len(actions)} docs.")
-        except helpers.BulkIndexError as bulk_error:
-            print(f"[ElasticsearchIndexer] Bulk insert error: Some documents failed.")
+            success, errors = bulk(self.client, actions)
+            print(f"[OpenSearchIndexer] Inserted {success} docs, errors={errors}")
         except Exception as e:
-            print(f"[ElasticsearchIndexer] Unexpected error during bulk index. {e}")
+            print(f"[OpenSearchIndexer] Bulk indexing error: {e}")
 
-    def search(self, query_emb: np.ndarray, k: int = 3) -> List[Tuple[str, float]]:
-        """
-        Search in Elasticsearch using the given query embeddings for the relevant document chunks.
-        Official Documentation for Search:
-        client.search(
-            index="my-index",
-            size=3,
-            query={
-              "knn": {
-                "field": "embedding",
-                "query_vector": [...],
-                "k": 10
-              }
-            }
-        )
-        """
-
-        if not self.es or query_emb.size == 0:
+    def search(
+        self, query_emb: np.ndarray, k: int = 3
+    ) -> List[Tuple[Dict[str, str], float]]:
+        if not self.client or query_emb.size == 0:
             return []
 
+        # Normalize query embedding for cosine similarity
+        q_norm = np.linalg.norm(query_emb, axis=1, keepdims=True)
+        query_emb = query_emb / (q_norm + 1e-9)
         vector = query_emb[0].tolist()
+        query_body = {
+            "size": k,
+            "query": {"knn": {"embedding": {"vector": vector, "k": k}}},
+        }
         try:
-            resp = self.es.search(
-                index=self.index_name,
-                size=k,
-                query={"knn": {"field": "embedding", "query_vector": vector, "k": k}},
-            )
+            resp = self.client.search(index=self.index_name, body=query_body)
             hits = resp["hits"]["hits"]
             results = []
             for h in hits:
-                doc_text = h["_source"]["text"]
                 doc_score = h["_score"]
-                results.append((doc_text, float(doc_score)))
-
-            print(f"[ElasticsearchIndexer] Found {len(results)} docs in search.")
+                doc_source = h["_source"]
+                results.append((doc_source, float(doc_score)))
+            print(f"[OpenSearchIndexer] Found {len(results)} docs in search.")
             return results
         except Exception as e:
-            print(f"[ElasticsearchIndexer] Search error: {e}")
+            print(f"[OpenSearchIndexer] Search error: {e}")
             return []
-
-    def fetch_all_docs(self) -> Tuple[np.ndarray, List[str]]:
-        # Fetch all docs from this ES index. Returns (embeddings in nparray format, texts in a list like [text, text, ...])
-
-        if not self.es:
-            return np.array([]), []
-
-        # Scroll or search approach - a simple match all with scroll
-        embeddings = []
-        texts = []
-        try:
-            resp = self.es.search(
-                index=self.index_name, scroll="2m", size=1000, query={"match_all": {}}
-            )
-            sid = resp["_scroll_id"]
-            hits = resp["hits"]["hits"]
-
-            while hits:
-                for h in hits:
-                    source = h["_source"]
-                    texts.append(source["text"])
-                    emb = source["embedding"]
-                    embeddings.append(emb)
-
-                resp = self.es.scroll(scroll_id=sid, scroll="2m")
-                sid = resp["_scroll_id"]
-                hits = resp["hits"]["hits"]
-        except Exception as e:
-            print(f"[ElasticsearchIndexer] fetch_all_docs error: {e}")
-            return np.array([]), []
-
-        return np.array(embeddings, dtype=np.float32), texts
-
-
-# File Paths
-PMC_DIR = "./PMC"
 
 
 # Basic Pre-processing
@@ -335,8 +279,10 @@ def basic_cleaning(text: str) -> str:
     return text.replace("\n", " ").strip()
 
 
-def chunk_text(text: str, chunk_size=150) -> List[str]:
-    words = text.split()
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
+    # Larger chunk size -> fewer chuinks
+    # But each chunk is bigger, which can degrade retrieval precision if chunks are too large
+    words = text.split()  # words = [word1, word2, ...]
     chunks = []
     for i in range(0, len(words), chunk_size):
         chunk = " ".join(words[i : i + chunk_size])
@@ -344,307 +290,178 @@ def chunk_text(text: str, chunk_size=150) -> List[str]:
     return chunks
 
 
-# RAG model and background replication
-
-
-def replicate_faiss_to_es(
-    faiss_indexer: FaissIndexer, es_indexer: ElasticsearchIndexer
-):
-    # Background task to replicate data from FAISS => ES
-    print("[BackgroundTasks] Finished replicating FAISS => ES.")
-    emb, docs = faiss_indexer.get_all_vectors_and_texts()
-    es_indexer.add_embeddings(emb, docs)
-
-
-def replicate_es_to_faiss(
-    es_indexer: ElasticsearchIndexer, faiss_indexer: FaissIndexer
-):
-    # Background task to replicate data from ES => FAISS
-    print("[BackgroundTasks] Finished replicating ES => FAISS.")
-    es_emb, es_docs = es_indexer.fetch_all_docs()
-    faiss_indexer.add_embeddings(es_emb, es_docs)
-
-
+# RAG model
 class RAGModel:
-    """
-    1. Checks existing embeddings in FAISS + ES + Pinecone (not in the current version of the code)
-    2. Generates new embeddings only if both are empty
-    3. If one is non-empty and the other is empty, replicate embeddings
-    4. Searches individually or combined
-    5. Answer-generation with GPT-4o
-    """
+    def __init__(self):
+        self.os_indexer: Optional[OpenSearchIndexer] = None
+        if os_client:
+            self.os_indexer = OpenSearchIndexer(os_client, OPENSEARCH_INDEX_NAME)
 
-    def __init__(
-        self,
-        pmc_dir: str,
-        use_elastic: bool = True,
-        background_tasks: Optional[BackgroundTasks] = None,
-    ):
-        self.faiss_indexer = FaissIndexer(dim=EMBED_DIM)
-        self.elasticsearch_indexer: Optional[ElasticsearchIndexer] = None
-        # replication_src: 0 => FAISS->ES, 1 => ES->FAISS, -1 => no replication
-        self.replication_src: int = -1
-
-        if use_elastic and es_client:
-            self.elasticsearch_indexer = ElasticsearchIndexer(
-                es_client, ELASTIC_INDEX_NAME
-            )
-
-        # Decide if we need new embeddings at all
-        faiss_empty = self.faiss_indexer.is_empty()
-        es_empty = True
-        if self.elasticsearch_indexer and self.elasticsearch_indexer.has_any_data():
-            es_empty = False
-
-        # If both FAISS + ES have data, do nothing
-        if not faiss_empty and not es_empty:
-            print("[RAGModel] FAISS and ES both have data. No re-embedding.")
+    def build_embeddings_from_scratch(self, pmc_dir: str):
+        if not self.os_indexer:
+            print("[RAGModel] No OpenSearchIndexer => cannot build embeddings.")
             return
 
-        # If FAISS is not empty but ES is empty => pull from FAISS and store in ES
-        if not faiss_empty and es_empty:
-            print(
-                "[RAGModel] FAISS has data, ES is empty => pushing FAISS embeddings to ES."
-            )
-            self.replication_src = 0  # FAISS => ES
-            if self.elasticsearch_indexer and background_tasks:
-                background_tasks.add_task(
-                    replicate_faiss_to_es,
-                    self.faiss_indexer,
-                    self.elasticsearch_indexer,
-                )
-            elif self.elasticsearch_indexer:
-                replicate_faiss_to_es(self.faiss_indexer, self.elasticsearch_indexer)
-
+        # If the index has data, skip
+        if self.os_indexer.has_any_data():
+            print("[RAGModel] OpenSearch already has data. Skipping embedding.")
             return
 
-        # If FAISS is empty but ES is not => pull from ES and build FAISS
-        if faiss_empty and not es_empty:
-            print(
-                "[RAGModel] ES has data, FAISS is empty => pulling ES embeddings to FAISS."
-            )
-            self.replication_src = 1  # ES => FAISS
-            if self.elasticsearch_indexer and background_tasks:
-                background_tasks.add_task(
-                    replicate_es_to_faiss,
-                    self.elasticsearch_indexer,
-                    self.faiss_indexer,
-                )
-            elif self.elasticsearch_indexer:
-                replicate_es_to_faiss(self.elasticsearch_indexer, self.faiss_indexer)
+        print("[RAGModel] Building embeddings from scratch...")
+        data_files = os.listdir(pmc_dir)
+        all_docs = []
 
-            return
-
-        # Otherwise => both are empty => embed from scratch
-        print(
-            "[RAGModel] Both FAISS & ES are empty => generating embeddings from scratch."
-        )
-        self._build_embeddings_from_scratch(pmc_dir)
-
-    def _build_embeddings_from_scratch(self, pmc_dir: str):
-        # load data
-        data_texts = self._load_pmc_data(pmc_dir)
-        data_texts = [txt for txt in data_texts if txt.strip()]
-
-        # chunk + clean
-        cleaned = [basic_cleaning(t) for t in data_texts]
-        chunks = []
-        for c in cleaned:
-            chunks.extend(chunk_text(c))
-
-        if not chunks:
-            print("[RAGModel] No text found.")
-            return
-
-        print(f"[RAGModel] Generating embeddings for {len(chunks)} chunks.")
-        embs = embed_texts(chunks)
-
-        print("[RAGModel] Adding data to FAISS index.")
-        self.faiss_indexer.add_embeddings(embs, chunks)
-
-        if self.elasticsearch_indexer:
-            print("[RAGModel] Adding data to Elasticsearch index.")
-            self.elasticsearch_indexer.add_embeddings(embs, chunks)
-
-    def _load_pmc_data(self, directory: str) -> List[str]:
-        results = []
-        if not os.path.isdir(directory):
-            print(f"[WARNING] PMC dir '{directory}' not found.")
-            return results
-
-        # i = 1
-        for fname in os.listdir(directory):
-            # if i > 100:
-            #     break
-
-            # i += 1
+        for fname in data_files:
             if fname.startswith("PMC") and fname.endswith(".txt"):
-                path = os.path.join(directory, fname)
+                path = os.path.join(pmc_dir, fname)
                 try:
                     with open(path, "r", encoding="utf-8") as f:
-                        results.append(f.read())
+                        text = f.read()
                 except UnicodeDecodeError:
-                    try:
-                        with open(path, "r", encoding="latin-1") as f:
-                            results.append(f.read())
-                        print(f"[WARNING] '{fname}' read with 'latin-1' fallback.")
-                    except:
-                        print(f"[ERROR] Could not decode '{fname}'. Skipping.")
+                    with open(path, "r", encoding="latin-1") as f:
+                        text = f.read()
 
-        return results
+                cleaned_text = basic_cleaning(text)
+                text_chunks = chunk_text(cleaned_text, CHUNK_SIZE)
+                for chunk_str in text_chunks:
+                    all_docs.append({"doc_id": fname, "text": chunk_str})
 
-    # Searching
-    def faiss_search_with_emb(self, query_emb: np.ndarray, top_k=3):
-        return self.faiss_indexer.search(query_emb, k=top_k)
+        if not all_docs:
+            print("[RAGModel] No text found in directory. Exiting.")
+            return
 
-    def es_search_with_emb(self, query_emb: np.ndarray, top_k=3):
-        if not self.elasticsearch_indexer:
+        print(f"[RAGModel] Generating embeddings for {len(all_docs)} chunks...")
+        # Embed the chunk texts
+        chunk_texts = [d["text"] for d in all_docs]
+        embs = embed_texts(chunk_texts)
+        self.os_indexer.add_embeddings(embs, all_docs)
+        print("[RAGModel] Finished embedding & indexing data in OpenSearch.")
+
+    def os_search(self, query_emb: np.ndarray, top_k=3):
+        if not self.os_indexer:
             return []
 
-        return self.elasticsearch_indexer.search(query_emb, k=top_k)
+        return self.os_indexer.search(query_emb, k=top_k)
 
-    def combined_search(self, query_emb: np.ndarray, top_k=3):
+    def ask(self, query: str, top_k: int = 3) -> str:
         """
-        If replication is in progress from FAISS => ES, that means ES is partial => skip ES results.
-        If replication is in progress from ES => FAISS, that means FAISS is partial => skip FAISS results.
-        Otherwise search both and merge the results.
-
-        FAISS => (text, distance) => convert distance => "score"
-        ES => (text, score) and Sort by descending score
+        1. Embed query and check Redis cache to see if we have a "similar enough" query response
+        2. If not found, do approximate search in OpenSearch, retrieve relevant documents
+        3. Generate final answer with LLM
+        4. Store result in Redis cache for future queries
         """
+        if not query.strip():
+            return "[ERROR] Empty query."
 
-        results = []
-        # ES
-        if self.replication_src == -1 or self.replication_src == 1:
-            # if we are not replicating, or replicating from ES => FAISS,
-            # then ES has the complete data, we do an ES search
+        # Redis cache lookup
+        query_emb = embed_query(query)
+        cached_resp = find_similar_query_in_redis(query_emb)
+        if cached_resp is not None:
             print(
-                "[RAGModel] Replication ES=>FAISS in progress. Hence, skipping FAISS in combined search."
+                "[RAGModel] Found a similar query in Redis cache. Returning cached result."
             )
-            es_res = self.es_search_with_emb(query_emb, top_k)
-            results.extend(es_res)
+            return cached_resp
 
-        # FAISS
-        if self.replication_src == -1 or self.replication_src == 0:
-            # if not replicating, or replicating from FAISS => ES
-            # then FAISS has the data
-            print(
-                "[RAGModel] Replication FAISS=>ES in progress. Hence, skipping Elasticsearch in combined search."
-            )
-            faiss_res = self.faiss_search_with_emb(query_emb, top_k)
-            # Convert distance => score
-            faiss_converted = [(txt, 1.0 - dist) for (txt, dist) in faiss_res]
-            results.extend(faiss_converted)
+        # Not in cache => do approximate search in OpenSearch
+        results = self.os_search(query_emb, top_k=top_k)
 
-        # Sort descending by "score"
-        sorted_results = sorted(results, key=lambda x: x[1], reverse=True)
-        return sorted_results[:top_k]
+        # Group chunks by doc_id to pass relevant documents to LLM
+        doc_map = {}
+        for doc_dict, score in results:
+            doc_id = doc_dict["doc_id"]
+            text_chunk = doc_dict["text"]
+            if doc_id not in doc_map:
+                doc_map[doc_id] = text_chunk
+            else:
+                doc_map[doc_id] += "\n" + text_chunk
 
-    def ask(self, query_emb: np.ndarray, original_query: str, top_k=3) -> str:
-        """
-        Use a pre-computed embedding for the query to retrieve chunks, then LLM.
-        Augmentation and LLM query-answering
-        1) Retrieve top_k doc chunks
-        2) Combine them with the user query
-        3) Call GPT-4o to get final answer
-        """
+        context_text = ""
+        for doc_id, doc_content in doc_map.items():
+            context_text += f"--- Document: {doc_id} ---\n{doc_content}\n\n"
 
-        res = self.combined_search(query_emb, top_k=top_k)
-        context_docs = [r[0] for r in res]
-
-        context_text = "\n\n".join(context_docs)
         final_prompt = (
-            f"User query:\n{original_query}\n\n"
-            f"Relevant context:\n{context_text}\n\n"
-            "Given the context, answer as helpfully as possible using only that. Directly jump to the answer without mentioning about the context given. But if insufficient context, say so."
+            f"User query:\n{query}\n\n"
+            f"Relevant documents:\n{context_text}\n\n"
+            "Please provide the best possible answer using ONLY the info above. "
+            "If the info is insufficient, say so."
         )
-        return call_llm_gpt(final_prompt)
+
+        answer = call_llm(final_prompt)
+        store_query_in_redis(query_emb, answer)  # cache in Redis
+        return answer
 
 
+import asyncio
 from contextlib import asynccontextmanager
-
 
 # FastAPI integrated for REST APIs
 app = FastAPI(
-    title="RAG with OpenAI LLMs and embedding model",
-    version="1.0.0",
-    description="End-to-end RAG pipeline using FAISS, Elasticsearch, and OpenAI LLM GPT-4o + Embedding Model like text-embedding-ada-002.",
-    lifespan=lambda app: lifespan(app),
+    title="RAG with Ollama + OpenSearch + Redis",
+    version="2.0.0",
+    description="RAG pipeline to answer medical queries using Ollama embeddings, OpenSearch ANN, and Redis cache.",
 )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Lifespan event handler to initialize and clean up resources if needed.
-    print("[Lifespan] Server is starting up...")
-    background_tasks = BackgroundTasks()
+    """
+    Properly initialize RAGModel before API starts and
+    clean up resources on shutdown.
+    """
+    print("[Lifespan] Initializing RAGModel...")
+    global rag_model
+    rag_model = RAGModel()
 
-    # Instantiate RAGModel and store it in app.state
-    app.state.rag_model = RAGModel(
-        pmc_dir="./PMC", use_elastic=True, background_tasks=background_tasks
-    )
-    print("[Lifespan] RAGModel instantiated and replication tasks started if any.")
-    yield
-    # When the app is shutting down:
+    # Run embedding sync inside a separate thread pool for non-blocking startup
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, rag_model.build_embeddings_from_scratch, PMC_DIR)
+
+    print("[Lifespan] RAGModel is ready.")
+    yield  # Application is running
     print("[Lifespan] Server is shutting down...")
 
 
-# Dependency to retrieve the RAGModel instance from app.state
+app.router.lifespan_context = lifespan
+
+
 def get_rag_model() -> RAGModel:
-    if not hasattr(app.state, "rag_model"):
-        raise RuntimeError("RAGModel not initialized.")
     return app.state.rag_model
 
 
-@app.post("/search/faiss")
-def search_faiss_route(
-    query: str = Body(...), top_k: int = 3, rag_model: RAGModel = Depends(get_rag_model)
-):
-    # FAISS search with the embeddings
-    q_emb = embed_query(query)
-    results = rag_model.faiss_search_with_emb(q_emb, top_k=top_k)
+@app.post("/search/opensearch")
+async def search_opensearch_route(query: str = Body(...), top_k: int = 50):
+    """
+    API endpoint for OpenSearch ANN search.
+    """
+    rag_model = get_rag_model()
+    loop = asyncio.get_running_loop()
+
+    # Run embedding generation in thread pool to avoid blocking event loop
+    q_emb = await loop.run_in_executor(None, embed_query, query)
+
+    results = await loop.run_in_executor(None, rag_model.os_search, q_emb, top_k)
     return {
         "query": query,
         "top_k": top_k,
-        "results": [{"text": r[0], "distance": r[1]} for r in results],
-    }
-
-
-@app.post("/search/elasticsearch")
-def search_es_route(
-    query: str = Body(...), top_k: int = 3, rag_model: RAGModel = Depends(get_rag_model)
-):
-    # Elastic-search with the embeddings
-    q_emb = embed_query(query)
-    results = rag_model.es_search_with_emb(q_emb, top_k=top_k)
-    return {
-        "query": query,
-        "top_k": top_k,
-        "results": [{"text": r[0], "score": r[1]} for r in results],
-    }
-
-
-@app.post("/search/combined")
-def search_combined_route(
-    query: str = Body(...), top_k: int = 3, rag_model: RAGModel = Depends(get_rag_model)
-):
-    # Embed query once and combined search with the embeddings
-    q_emb = embed_query(query)
-    results = rag_model.combined_search(q_emb, top_k=top_k)
-    return {
-        "query": query,
-        "top_k": top_k,
-        "results": [{"text": r[0], "score": r[1]} for r in results],
+        "results": [
+            {"doc_id": r[0]["doc_id"], "text": r[0]["text"], "score": r[1]}
+            for r in results
+        ],
     }
 
 
 @app.post("/ask")
-def query_text(
-    query: str = Body(...), top_k: int = 3, rag_model: RAGModel = Depends(get_rag_model)
-):
-    # Query -> Query Embedding -> Retrieval from ElasticSearch + FAISS -> Augmented -> GPT LLM.
-    q_emb = embed_query(query)
-    answer = rag_model.ask(q_emb, query, top_k=top_k)
+async def ask_route(query: str = Body(...), top_k: int = 50):
+    """API endpoint for handling user queries.
+    Query -> Embedding Model -> Query Embeddings -> Redis lookup (if not found)
+    -> OpenSearch ANN -> Large Lang Model -> Redis cache (store op)
+    """
+
+    rag_model = get_rag_model()
+    loop = asyncio.get_running_loop()
+
+    # fetch the answer (includes Redis lookup, OpenSearch search, LLM call)
+    answer = await loop.run_in_executor(None, rag_model.ask, query, top_k)
     return {"query": query, "answer": answer}
 
 

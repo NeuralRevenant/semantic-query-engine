@@ -1,0 +1,12 @@
+uvicorn
+fastapi
+sentence-transformers
+transformers
+torch
+torchvision
+torchaudio
+llama-cpp-python
+numpy
+httpx
+redis
+opensearch-py
