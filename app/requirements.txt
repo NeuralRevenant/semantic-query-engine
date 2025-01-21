@@ -1,12 +1,11 @@
 uvicorn
 fastapi
 sentence-transformers
-transformers
+transformers>=4.33.0
 torch
-torchvision
-torchaudio
-llama-cpp-python
+accelerate
 numpy
-httpx
 redis
 opensearch-py
+asyncio
+typing

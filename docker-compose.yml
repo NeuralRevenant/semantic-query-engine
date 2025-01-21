@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: semantic-query-engine
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - opensearch
+    environment:
+      - REDIS_HOST=redis
+      - OPENSEARCH_HOST=opensearch
+      - OPENSEARCH_PORT=9200
+
+    # Enable GPU usage
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1        # or "all"
+              capabilities: ["gpu"]
+
+    # If the Docker version doesn't support the above,
+    # can use runtime: nvidia with older Docker versions:
+    # runtime: nvidia
+
+  redis:
+    image: redis:latest
+    container_name: redis-cache
+    ports:
+      - "6379:6379"
+
+  opensearch:
+    image: opensearchproject/opensearch:latest
+    container_name: opensearch-db
+    environment:
+      - discovery.type=single-node
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=admin
+    ports:
+      - "9200:9200"

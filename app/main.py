@@ -1,6 +1,5 @@
 import os
 import json
-import requests
 import numpy as np
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -11,13 +10,21 @@ import redis
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
 
+import asyncio
+from contextlib import asynccontextmanager
+
+
+import torch
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, pipeline
+
+
 # Config Constants
-LLM_MODEL = "mistral:7b"
-EMBED_MODEL = "mistral:7b"
+EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+LLM_MODEL_NAME = "meta-llama/Llama-2-7b-hf"
 OLLAMA_API_URL = "http://localhost:11434/api"
 BATCH_SIZE = 128
-CHUNK_SIZE = 1024
-EMBED_DIM = 4096  # Mistral typically yields 4096-d embeddings in Ollama
+CHUNK_SIZE = 512
+EMBED_DIM = 384
 
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
@@ -75,66 +82,93 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (norm_a * norm_b))
 
 
-# Ollama Synchronous Embedding Calls
+# Embedding Model Setup
+print("[INFO] Initializing Hugging Face embedding model...")
+
+# If CUDA is available, load model on GPU
+device_for_embedding = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+embedding_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME)
+embedding_model = AutoModel.from_pretrained(EMBED_MODEL_NAME).to(device_for_embedding)
+
+
 def embed_texts(texts: List[str]) -> np.ndarray:
     """
-    Calls Ollama /api/embeddings for each text individually. Because Mistral in
-    Ollama doesn’t batch multiple texts at once, we loop.
+    Generate embeddings for a list of texts using a Hugging Face model.
+    Returns an np.ndarray of shape (len(texts), EMBED_DIM).
     """
     if not texts:
         return np.array([])
 
-    all_embeddings = []
+    embeddings = []
     for text in texts:
-        payload = {"model": EMBED_MODEL, "prompt": text}
-        try:
-            resp = requests.post(
-                f"{OLLAMA_API_URL}/embeddings",
-                json=payload,
-                timeout=60,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            embedding_vec = data.get("embedding", [])
-            # If the model fails or returns nothing, skip the round
-            if not embedding_vec:
-                continue
+        # Tokenize and move inputs to GPU if available
+        inputs = embedding_tokenizer(text, return_tensors="pt", truncation=True)
+        inputs = {k: v.to(device_for_embedding) for k, v in inputs.items()}
 
-            all_embeddings.append(embedding_vec)
-        except requests.RequestException as e:
-            print(f"[Embedding ERROR] {e}")
-            return np.array([])
+        with torch.no_grad():
+            outputs = embedding_model(**inputs)
+            # outputs.last_hidden_state: [batch_size, seq_len, hidden_size]
+            # We'll do mean pooling across seq_len for a single sentence:
+            hidden_states = (
+                outputs.last_hidden_state
+            )  # shape: [1, seq_len, hidden_size]
+            sentence_emb = hidden_states.mean(dim=1).squeeze(0)  # [hidden_size]
 
-    return np.array(all_embeddings, dtype=np.float32)
+        # Normalize for using cosine similarity
+        norm = sentence_emb.norm(p=2)
+        sentence_emb = sentence_emb / (norm + 1e-9)
+
+        # Move back to CPU numpy
+        embeddings.append(sentence_emb.cpu().numpy())
+
+    return np.array(embeddings, dtype=np.float32)
 
 
 def embed_query(query: str) -> np.ndarray:
+    """
+    Embeds a single query string using the same HF model.
+    """
     if not query.strip():
         return np.array([])
-
-    arr = embed_texts([query])
-    if arr.size == 0:
-        return np.array([])
-    return arr
+    # embed_texts returns shape [num_texts, EMBED_DIM], so this will be shape [1, EMBED_DIM]
+    return embed_texts([query])
 
 
-# Ollama-based LLM Calls (Mistral 7B)
+# Text Generation (LLM)
+print("[INFO] Initializing Hugging Face generation model...")
+
+# If CUDA is available, we set device=0 for the HF pipeline
+device_for_generation = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+generation_tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
+generation_model = AutoModelForCausalLM.from_pretrained(LLM_MODEL_NAME).to(
+    device_for_generation
+)
+
+# Create a pipeline for text generation
+text_generator = pipeline(
+    "text-generation",
+    model=generation_model,
+    tokenizer=generation_tokenizer,
+    device=0 if torch.cuda.is_available() else -1,
+)
+
+
 def call_llm(prompt: str) -> str:
     """
-    Synchronous call to Mistral 7B via Ollama /api/generate.
+    Calls the Hugging Face text-generation pipeline to produce the model's response.
     """
-    payload = {"model": LLM_MODEL, "prompt": prompt, "stream": False}
-    try:
-        resp = requests.post(
-            f"{OLLAMA_API_URL}/generate",
-            json=payload,
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("response", "[LLM ERROR] No response").strip()
-    except requests.RequestException as e:
-        return f"[LLM ERROR] {e}"
+    outputs = text_generator(
+        prompt,
+        max_length=512,  # increase max length for better responses
+        num_return_sequences=1,
+        do_sample=True,
+        temperature=0.7,
+        top_k=50,
+        top_p=0.95,
+    )
+    return outputs[0]["generated_text"].strip()
 
 
 # OpenSearch Setup with HNSW ANN
@@ -248,6 +282,9 @@ class OpenSearchIndexer:
     def search(
         self, query_emb: np.ndarray, k: int = 3
     ) -> List[Tuple[Dict[str, str], float]]:
+        """
+        Perform approximate nearest neighbor (k-NN) search using the query embedding.
+        """
         if not self.client or query_emb.size == 0:
             return []
 
@@ -267,6 +304,7 @@ class OpenSearchIndexer:
                 doc_score = h["_score"]
                 doc_source = h["_source"]
                 results.append((doc_source, float(doc_score)))
+
             print(f"[OpenSearchIndexer] Found {len(results)} docs in search.")
             return results
         except Exception as e:
@@ -280,8 +318,9 @@ def basic_cleaning(text: str) -> str:
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
-    # Larger chunk size -> fewer chuinks
-    # But each chunk is bigger, which can degrade retrieval precision if chunks are too large
+    """
+    Splits the text into chunks of size 'chunk_size' (by word count).
+    """
     words = text.split()  # words = [word1, word2, ...]
     chunks = []
     for i in range(0, len(words), chunk_size):
@@ -298,6 +337,10 @@ class RAGModel:
             self.os_indexer = OpenSearchIndexer(os_client, OPENSEARCH_INDEX_NAME)
 
     def build_embeddings_from_scratch(self, pmc_dir: str):
+        """
+        Reads text files from the directory, chunks them, embeds, and stores in OpenSearch.
+        Skips if we already have data in the index.
+        """
         if not self.os_indexer:
             print("[RAGModel] No OpenSearchIndexer => cannot build embeddings.")
             return
@@ -345,9 +388,9 @@ class RAGModel:
 
     def ask(self, query: str, top_k: int = 3) -> str:
         """
-        1. Embed query and check Redis cache to see if we have a "similar enough" query response
-        2. If not found, do approximate search in OpenSearch, retrieve relevant documents
-        3. Generate final answer with LLM
+        1. Embed query and check Redis cache for a "similar enough" query response
+        2. If not found, do approximate search in OpenSearch for relevant docs
+        3. Call LLM to generate final answer
         4. Store result in Redis cache for future queries
         """
         if not query.strip():
@@ -391,22 +434,18 @@ class RAGModel:
         return answer
 
 
-import asyncio
-from contextlib import asynccontextmanager
-
 # FastAPI integrated for REST APIs
 app = FastAPI(
-    title="RAG with Ollama + OpenSearch + Redis",
+    title="RAG with Transformer models + OpenSearch + Redis",
     version="2.0.0",
-    description="RAG pipeline to answer medical queries using Ollama embeddings, OpenSearch ANN, and Redis cache.",
+    description="RAG pipeline to answer medical queries using transformer models, OpenSearch ANN, and Redis cache.",
 )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Properly initialize RAGModel before API starts and
-    clean up resources on shutdown.
+    Initialize RAGModel before the API starts and clean up resources on shutdown.
     """
     print("[Lifespan] Initializing RAGModel...")
     global rag_model
@@ -425,7 +464,7 @@ app.router.lifespan_context = lifespan
 
 
 def get_rag_model() -> RAGModel:
-    return app.state.rag_model
+    return rag_model
 
 
 @app.post("/search/opensearch")
@@ -433,13 +472,14 @@ async def search_opensearch_route(query: str = Body(...), top_k: int = 50):
     """
     API endpoint for OpenSearch ANN search.
     """
-    rag_model = get_rag_model()
-    loop = asyncio.get_running_loop()
+    rm = get_rag_model()
+    if not rm:
+        return {"error": "RAGModel not initialized."}
 
+    loop = asyncio.get_running_loop()
     # Run embedding generation in thread pool to avoid blocking event loop
     q_emb = await loop.run_in_executor(None, embed_query, query)
-
-    results = await loop.run_in_executor(None, rag_model.os_search, q_emb, top_k)
+    results = await loop.run_in_executor(None, rm.os_search, q_emb, top_k)
     return {
         "query": query,
         "top_k": top_k,
@@ -456,12 +496,13 @@ async def ask_route(query: str = Body(...), top_k: int = 50):
     Query -> Embedding Model -> Query Embeddings -> Redis lookup (if not found)
     -> OpenSearch ANN -> Large Lang Model -> Redis cache (store op)
     """
+    rm = get_rag_model()
+    if not rm:
+        return {"error": "RAG Model not initialized"}
 
-    rag_model = get_rag_model()
     loop = asyncio.get_running_loop()
-
     # fetch the answer (includes Redis lookup, OpenSearch search, LLM call)
-    answer = await loop.run_in_executor(None, rag_model.ask, query, top_k)
+    answer = await loop.run_in_executor(None, rm.ask, query, top_k)
     return {"query": query, "answer": answer}
 
 
