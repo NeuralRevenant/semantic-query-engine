@@ -1,0 +1,8 @@
+numpy
+fastapi
+uvicorn
+redis
+opensearch-py
+torch>=1.13.1
+transformers>=4.27.0
+sentence-transformers>=2.2.2
