@@ -1,11 +1,14 @@
 # **RAG-based Semantic Query Engine**
 
-A Retrieval-Augmented Generation (RAG) pipeline that enables semantic search and query answering for medical documents. This system integrates **Ollama's Mistral-7B embeddings**, **OpenSearch for vector-based Approximate Nearest Neighbor (ANN) search**, and **Redis for query caching** to provide efficient and accurate responses to user queries.
+A Retrieval-Augmented Generation (RAG) pipeline that enables semantic search and query answering for medical documents. This system integrates **Ollama's jina/jina-embeddings-v2-base-de embeddings & Mistral-7B LLM**, **OpenSearch for vector-based Approximate Nearest Neighbor (ANN) search**, and **Redis for query caching** to provide efficient and accurate responses to user queries.
 
 ---
 
+![RAG drawio](https://github.com/user-attachments/assets/6b789801-e1de-4192-a409-fb74dd43aa3c)
+
+
 ## **Key Features**
-- **Semantic Search**: Uses **Mistral-7B** embeddings via Ollama to generate high-dimensional text representations.
+- **Semantic Search**: Uses **jina/jina-embeddings-v2-base-de** embeddings (768 dimensional vectors or R^768 space) via Ollama to generate high-dimensional text representations.
 - **Retrieval-Augmented Generation (RAG)**: Combines OpenSearch-based semantic retrieval with Mistral-7B for intelligent query answering.
 - **Efficient Caching**:
   - **Redis** stores previous queries and responses to optimize search speed.
@@ -22,7 +25,7 @@ A Retrieval-Augmented Generation (RAG) pipeline that enables semantic search and
 
 ## **How It Works**
 1. **Embedding Generation**:
-   - Input text is converted into embeddings using **Mistral-7B** via Ollama.
+   - Input text is converted into embeddings using **jina/jina-embeddings-v2-base-de** via Ollama.
 2. **Indexing**:
    - OpenSearch indexes document chunks with corresponding embeddings.
 3. **Query Execution**:
@@ -42,14 +45,14 @@ A Retrieval-Augmented Generation (RAG) pipeline that enables semantic search and
   ```json
   {
       "query": "What are the symptoms of pneumonia?",
-      "top_k": 3
+      "top_k": 5
   }
   ```
 - **Response**:
   ```json
   {
       "query": "What are the symptoms of pneumonia?",
-      "top_k": 3,
+      "top_k": 5,
       "results": [
           {"doc_id": "PMC12345.txt", "text": "Pneumonia symptoms include cough, fever, and difficulty breathing.", "score": 0.87},
           {"doc_id": "PMC67890.txt", "text": "Symptoms can vary but commonly include fever and shortness of breath.", "score": 0.85}
@@ -64,7 +67,7 @@ A Retrieval-Augmented Generation (RAG) pipeline that enables semantic search and
   ```json
   {
       "query": "How does pneumonia affect lung function?",
-      "top_k": 3
+      "top_k": 5
   }
   ```
 - **Response**:
@@ -81,15 +84,7 @@ A Retrieval-Augmented Generation (RAG) pipeline that enables semantic search and
 
 ### **Prerequisites**
 1. **Python 3.8+**
-2. **Dependencies**:
-   - `fastapi`
-   - `uvicorn`
-   - `requests`
-   - `numpy`
-   - `opensearch-py`
-   - `redis`
-
-3. **Environment Setup**:
+2. **Environment Setup**:
    - **Ollama**: Running on `http://localhost:11434/api`
    - **OpenSearch**: Hosted locally or in a cloud environment
    - **Redis**: Running locally on port `6379`
@@ -122,7 +117,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ## **Scalability & Performance**
 - **OpenSearch** supports indexing **millions of documents** for scalable retrieval.
 - **Redis caching** significantly reduces response latency.
-- **Ollama embeddings** ensure accurate semantic understanding.
+- **Ollama's jina/jina-embeddings-v2-base-de embeddings** ensure accurate semantic understanding.
 
 ---
 
