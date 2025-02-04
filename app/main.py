@@ -2,9 +2,6 @@ import os
 import json
 import numpy as np
 from typing import List, Tuple, Optional, Dict, Any
-import re
-
-DOC_PATTERN = r"(?i)(document(?:\s+id)?\s+['\"]?[A-Za-z0-9._-]+['\"]?)"
 
 from fastapi import FastAPI, Body
 import uvicorn
@@ -16,12 +13,25 @@ from opensearchpy.helpers import bulk
 import asyncio
 from contextlib import asynccontextmanager
 
-import httpx
+import httpx  # for Ollama's embedding calls
+import openai  # for GPT-4o generation
 
-# Constants
+# ==============================================================================
+# Configuration Constants
+# ==============================================================================
+
+# Ollama specifics for embeddings
 OLLAMA_API_URL = "http://localhost:11434/api"
-EMBED_MODEL_NAME = "jina/jina-embeddings-v2-base-de"
-LLM_MODEL_NAME = "mistral:7b"
+EMBED_MODEL_NAME = "jina/jina-embeddings-v2-base-de"  # local Ollama embedding model
+
+# OpenAI specifics for generation
+OPENAI_API_KEY = os.getenv(
+    "OPENAI_API_KEY",
+    "",
+)
+openai.api_key = OPENAI_API_KEY
+OPENAI_CHAT_MODEL = "gpt-4o"
+
 BATCH_SIZE = 128
 CHUNK_SIZE = 512
 EMBED_DIM = 768
@@ -126,7 +136,7 @@ async def embed_texts_in_batches(texts: List[str], batch_size: int = 32) -> np.n
 
 
 async def embed_query(query: str) -> np.ndarray:
-    """Obtain an embedding for a single query."""
+    """Obtain an embedding for a single query from Ollama (local)."""
     if not query.strip():
         return np.array([])
 
@@ -134,90 +144,50 @@ async def embed_query(query: str) -> np.ndarray:
     return np.array([emb], dtype=np.float32)
 
 
-async def ollama_generate_text(prompt: str, model: str = LLM_MODEL_NAME) -> str:
+# ==============================================================================
+# OpenAI for Remote Generation
+# ==============================================================================
+async def openai_generate_text(
+    prompt: str,
+    model: str = OPENAI_CHAT_MODEL,
+    temperature: float = 0.6,
+    max_tokens: int = 256,
+) -> str:
     """
-    Request text generation from Ollama via HTTP POST.
-    Returns the "generated_text" field from the JSON.
+    Request text generation from the new openai.chat.completions interface.
+    Returns the generated text content.
     """
-    async with httpx.AsyncClient() as client:
-        payload = {
-            "model": model,
-            "messages": [
+    loop = asyncio.get_running_loop()
+
+    def _run_openai():
+        response = openai.chat.completions.create(
+            model=model,
+            messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You are a helpful AI assistant. You must follow these rules:\n"
-                        "1) Always cite document IDs from the context exactly as 'Document XYZ' without file extension.\n"
-                        "2) Do not add your chain-of-thought.\n"
-                        "3) You must answer exactly the user query and not the context but only use the context information to find your answer specific info.\n"
-                        "4) Keep the answer short and precise like at most 4 sentences.\n"
-                        "5) If you lack context, say so.\n\n"
+                        "You are a helpful assistant. Follow the user's instructions exactly.\n"
+                        "If you reference a document, use the phrase 'Document <ID>' without file extensions.\n"
+                        "Do not reveal your chain of thought."
                     ),
                 },
                 {"role": "user", "content": prompt},
             ],
-            "stream": False,
-            "options": {
-                "temperature": 0.6,
-                # "top_k": 50,
-                # "top_p": 0.9,
-                "max_tokens": 256,  # Limit the token count so the model does not ramble
-            },
-        }
-        resp = await client.post(f"{OLLAMA_API_URL}/chat", json=payload, timeout=60.0)
-        resp.raise_for_status()
-        data = resp.json()
-        # print(f"Result = {data}")
-        return data.get("message", {}).get("content", "").strip()
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        # Extract and return the content of the first completion
+        return response.choices[0].message.content.strip()
 
-
-def _contains_document_id(text: str) -> bool:
-    """Helper function to check if the text has any recognized document references."""
-    matches = re.findall(DOC_PATTERN, text)
-    return len(matches) > 0
+    # Offload the synchronous call to a thread pool to avoid blocking
+    return await loop.run_in_executor(None, _run_openai)
 
 
 async def call_llm(prompt: str) -> str:
-    """A wrapper to call the Ollama LLM generation endpoint."""
-    # 1) Get the initial response from the LLM
-    return await ollama_generate_text(prompt)
-
-    # # 2) Check if the response cites any document ID using regex
-    # if _contains_document_id(first_response):
-    #     return first_response
-    # else:
-    #     # 3) Prompt the LLM to revise if no document IDs were found
-    #     revised_prompt = (
-    #         "You did not cite any Document Name/ID. Please revise your answer. "
-    #         "Remember to cite Document Name/ID in the format found in the original context. "
-    #         "Use the exact Document ID(s) if available.\n\n"
-    #         f"Here is your previous answer:\n{first_response}\n\n"
-    #         f"Original Prompt & Context:\n{prompt}\n\n"
-    #         "Now, please provide a revised answer ensuring you include Document ID(s)."
-    #     )
-    #     second_response = await ollama_generate_text(revised_prompt)
-
-    #     # 4) Ask the model to pick the better response (A or B)
-    #     compare_prompt = (
-    #         "Below are two versions of your response, labeled A and B.\n\n"
-    #         f"Prompt: {prompt}\n\n"
-    #         f"A: {first_response}\n\n"
-    #         f"B: {second_response}\n\n"
-    #         "Which version (A or B) better satisfies the requirement "
-    #         "to cite the Document Name/ID accurately? Provide only one version as the final answer "
-    #         "and keep the references as-is if they match the instructions."
-    #     )
-    #     final_response = await ollama_generate_text(compare_prompt)
-
-    #     # Optional: Check if the final response now cites any Document ID
-    #     # If it still doesn't, you might prompt again or just return as-is.
-    #     if not _contains_document_id(final_response):
-    #         # (Optional) fallback: e.g., default to second_response or keep final_response
-    #         # Based on your needs, you might do one more iteration, or just return the second_response.
-    #         # For example:
-    #         return second_response
-
-    #     return final_response
+    """
+    A wrapper function for the answer generation step using OpenAI.
+    """
+    return await openai_generate_text(prompt)
 
 
 # ==============================================================================
@@ -442,7 +412,7 @@ class RAGModel:
           1. Get its embedding via Ollama.
           2. Check Redis cache for a similar query.
           3. If not cached, perform a k-NN search in OpenSearch.
-          4. Generate an answer via the Ollama LLM.
+          4. Generate an answer via the LLM.
           5. Cache and return the answer.
         """
         if not query.strip():
@@ -484,7 +454,7 @@ class RAGModel:
 
         final_prompt = (
             "INSTRUCTIONS: You must cite the **Document ID or Name** for any information you use. "
-            "Your answer must follow this format: Direct Answer (at most 4 sentences)\n -> References (list any Document IDs from which the answer is extracted, e.g., Document XYZ). "
+            "Your answer must follow this format: Direct Answer (at most 4 sentences)\nReferences (list any Document IDs from which the answer is extracted, e.g., Document XYZ). "
             "Your answer must be specific to the user query regardless of the provided context information. "
             "If the Document ID is 'PMC555957.txt', refer to it as 'Document PMC555957' (without the file extension). "
             "If multiple documents are relevant, cite each of them explicitly. "
@@ -522,9 +492,9 @@ class RAGModel:
 # FastAPI Application Setup
 # ==============================================================================
 app = FastAPI(
-    title="RAG with Ollama Models + OpenSearch + Redis",
-    version="3.0.0",
-    description="RAG pipeline to answer queries using Ollama's embedding/LLM, OpenSearch ANN, & Redis cache.",
+    title="RAG with LLMs + OpenSearch + Redis",
+    version="3.1",
+    description="RAG pipeline to answer queries using Ollama's embedding, OpenAI LLM, OpenSearch ANN, & Redis cache.",
 )
 
 
