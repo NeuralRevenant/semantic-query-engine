@@ -17,7 +17,7 @@ services:
       - OPENSEARCH_PORT=9200
       - HF_HOME=/root/.cache/huggingface
       - HUGGINGFACE_HUB_CACHE=/root/.cache/huggingface
-      - HUGGINGFACE_TOKEN=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
+      - HUGGINGFACE_TOKEN=ACCESS_TOKEN
     volumes:
       - /home/user-home/.cache/huggingface:/root/.cache/huggingface  # Mount the token inside the container
       - /home/user-home/.cache/huggingface/hub:/root/.cache/huggingface/hub  # Cache models inside container
@@ -46,6 +46,6 @@ services:
     container_name: opensearch-db
     environment:
       - discovery.type=single-node
-      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=secur@123Pwd#
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=PASSWORD
     ports:
       - "9200:9200"
