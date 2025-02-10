@@ -16,6 +16,9 @@ from contextlib import asynccontextmanager
 import httpx  # for Ollama's embedding calls
 import openai  # for GPT-4o generation
 
+import spacy  # Load the spaCy text categorizer
+from spacy.tokens import Doc
+
 # ==============================================================================
 # Configuration Constants
 # ==============================================================================
@@ -43,6 +46,9 @@ MAX_QUERY_CACHE = 1000
 CACHE_SIM_THRESHOLD = 0.96  # Cosine similarity threshold for cache lookup
 
 PMC_DIR = "./PMC"
+
+# We load the text-cat model from a local directory (adjust path if needed).
+SPACY_MODEL_PATH = "./model_nlu"
 
 # ==============================================================================
 # Redis Client & Cache Functions
@@ -223,7 +229,11 @@ try:
                             "name": "hnsw",
                             "engine": "nmslib",
                             "space_type": "cosinesimil",
-                            "parameters": {"m": 16, "ef_construction": 200},
+                            "parameters": {
+                                "m": 32,
+                                "ef_construction": 400,
+                                "ef_search": 200,
+                            },
                         },
                     },
                 }
@@ -345,6 +355,43 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
 
 
 # ==============================================================================
+# SpaCy Classification
+# ==============================================================================
+spacy_textcat_nlp = None
+
+
+def classify_query(query: str) -> str:
+    """
+    Classifies the user query using the loaded spaCy text-cat model.
+    Returns the best label, or 'retrieve_info' fallback if the model isn't loaded.
+    """
+    if not spacy_textcat_nlp:
+        return "retrieve_info"  # default if model missing
+    doc = spacy_textcat_nlp(query)
+    cats = doc.cats
+    best_label = max(cats, key=cats.get)
+    return best_label
+
+
+# A mapping from category -> top_k
+CATEGORY_TOPK_MAP = {
+    "count_documents": 100,
+    "retrieve_info": 5,
+    "summarize_documents": 5,
+    "compare_topics": 5,
+    "list_documents": 20,
+    "extract_specific_info": 5,
+    "answer_directly": 3,
+    "find_most_recent": 5,
+    "find_highly_cited": 10,
+    "document_metadata": 10,
+    "document_references": 10,
+    "filter_by_condition": 5,
+    "find_similar_documents": 5,
+}
+
+
+# ==============================================================================
 # RAG Model
 # ==============================================================================
 class RAGModel:
@@ -396,7 +443,6 @@ class RAGModel:
         embs = await embed_texts_in_batches(chunk_texts, batch_size=32)
 
         loop = asyncio.get_running_loop()
-        # Offload synchronous OpenSearch indexing to a thread pool
         await loop.run_in_executor(None, self.os_indexer.add_embeddings, embs, all_docs)
         print("[RAGModel] Finished embedding & indexing data in OpenSearch.")
 
@@ -409,11 +455,13 @@ class RAGModel:
     async def ask(self, query: str, top_k: int = 5) -> str:
         """
         Process a user query:
-          1. Get its embedding via Ollama.
-          2. Check Redis cache for a similar query.
-          3. If not cached, perform a k-NN search in OpenSearch.
-          4. Generate an answer via the LLM.
-          5. Cache and return the answer.
+          1. Get its embedding via Ollama
+          2. Check Redis cache and if found return the response
+          3. Classify the query with the spaCy model
+          4. Adjust top_k or other logic based on classification
+          5. If not cached in Redis, search OpenSearch
+          6. Call LLM for the final answer
+          7. Cache and return the answer
         """
         if not query.strip():
             return "[ERROR] Empty query."
@@ -429,11 +477,103 @@ class RAGModel:
             )
             return cached_resp
 
-        # 3) Search OpenSearch
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(None, self.os_search, query_emb, top_k)
+        # 3) Classify the query with spaCy
+        spacy_cat_label = classify_query(query)
 
-        # 4) Prepare context & call LLM
+        # If category is count, then do not load the documents them
+
+        # 4) Adjust the top_k parameter based on the predicted category
+        effective_top_k = CATEGORY_TOPK_MAP.get(spacy_cat_label, top_k)
+        loop = asyncio.get_running_loop()
+
+        if spacy_cat_label == "count_documents":
+            # The user wants to know how many documents talk about a subject
+            # We'll fetch documents in BATCHES and for each batch:
+            # Summarize them in a prompt
+            # Ask the LLM to count how many are truly relevant
+            # Then aggregate these partial counts
+
+            BATCH_SIZE_COUNT = 30
+            doc_offset = 0
+            total_relevant_count = 0
+            all_relevant_docs = []
+
+            while doc_offset < effective_top_k:
+                # We'll retrieve the next batch of documents by specifying the offset in search
+                batch_results = await loop.run_in_executor(
+                    None,
+                    self._search_with_offset,
+                    query_emb,
+                    BATCH_SIZE_COUNT,
+                    doc_offset,
+                )
+                if not batch_results:
+                    # No more results
+                    break
+
+                # Build a chunk of context
+                doc_map = {}
+                for doc_dict, score in batch_results:
+                    doc_id = doc_dict["doc_id"]
+                    text_chunk = doc_dict["text"]
+                    if doc_id not in doc_map:
+                        doc_map[doc_id] = text_chunk
+                    else:
+                        doc_map[doc_id] += "\n" + text_chunk
+
+                # Form a smaller prompt instructing the LLM:
+                #   "Out of these docs, which truly discuss <query subject>? Return count + doc IDs"
+                batch_context = ""
+                for doc_id, doc_content in doc_map.items():
+                    batch_context += f"--- Document: {doc_id} ---\n{doc_content}\n\n"
+
+                count_prompt = (
+                    "You are tasked with counting how many of the following documents truly discuss the user query.\n"
+                    "Return the total count of relevant documents, and list out the Document IDs that are relevant.\n"
+                    "Ignore or discard any irrelevant or partially relevant docs.\n\n"
+                    f"User Query for Counting:\n{query}\n\n"
+                    f"Documents:\n{batch_context}\n\n"
+                    "You must respond in the following JSON format EXACTLY:\n"
+                    "{\n"
+                    '  "relevant_count": <integer>,\n'
+                    '  "doc_ids": ["Doc1","Doc2",...]\n'
+                    "}\n"
+                    "Do not add anything else. Just the JSON in that format."
+                )
+
+                partial_answer = await call_llm(count_prompt)
+                # Now parse partial_answer JSON
+                try:
+                    partial_data = json.loads(partial_answer)
+                    batch_count = partial_data.get("relevant_count", 0)
+                    batch_docs = partial_data.get("doc_ids", [])
+                    total_relevant_count += batch_count
+                    all_relevant_docs.extend(
+                        batch_docs if isinstance(batch_docs, list) else []
+                    )
+                except json.JSONDecodeError:
+                    # If LLM response is invalid, skip or handle error
+                    pass
+
+                # Move offset
+                doc_offset += BATCH_SIZE_COUNT
+
+            # Now we have total_relevant_count + all_relevant_docs
+            # Build a final answer
+            final_count_response = (
+                f"Found {total_relevant_count} relevant documents that truly discuss your topic.\n"
+                f"Relevant Document IDs: {all_relevant_docs}"
+            )
+            # Cache in Redis
+            store_query_in_redis(query_emb, final_count_response)
+            return final_count_response
+
+        # 5) Search OpenSearch for other categories as usual
+        results = await loop.run_in_executor(
+            None, self.os_search, query_emb, effective_top_k
+        )
+
+        # 6) Prepare context & call LLM
         doc_map = {}
         for doc_dict, score in results:
             doc_id = doc_dict["doc_id"]
@@ -444,68 +584,102 @@ class RAGModel:
                 doc_map[doc_id] += "\n" + text_chunk
 
         print(f"[OpenSearchIndexer] Found {len(doc_map)} docs in search.")
-
         context_text = ""
         for doc_id, doc_content in doc_map.items():
-            print(doc_id)
             context_text += f"--- Document: {doc_id} ---\n{doc_content}\n\n"
-
-        # print(context_text)
 
         final_prompt = (
             "INSTRUCTIONS: You must cite the **Document ID or Name** for any information you use. "
             "Your answer must follow this format: Direct Answer (at most 4 sentences)\nReferences (list any Document IDs from which the answer is extracted, e.g., Document XYZ). "
-            "Your answer must be specific to the user query regardless of the provided context information. "
-            "If the Document ID is 'PMC555957.txt', refer to it as 'Document PMC555957' (without the file extension). "
-            "If multiple documents are relevant, cite each of them explicitly. "
-            "Do NOT reveal your reasoning or chain of thought.\n\n"
+            "Your answer must be specific to the user query. "
+            "If the Document ID is 'PMC555957.txt', refer to it as 'Document PMC555957' (no file extension). "
+            "If multiple documents are relevant, cite them explicitly. "
+            "Do NOT reveal your chain of thought.\n\n"
             f"User Query:\n{query}\n\n"
-            "Context:\n"
-            f"{context_text}\n"
+            f"Context:\n{context_text}\n"
             "--- End of context ---\n\n"
-            "Provide your answer strictly based on the above information. If insufficient or not relevant, then say so."
+            "Provide your answer strictly based on the above information. If insufficient, say so."
         )
-
-        # final_prompt = (
-        #     f"User query which you got to answer:\n{query}\n\n"
-        #     f"Base your answer on the relevant information or context provided in the following documents:\n"
-        #     f"{context_text}\n"
-        #     "--- End of context ---\n\n"
-        #     "Follow the below instructions very carefully and provide the answer:\n"
-        #     "Keep the answer specific to the user query and do not return irrelevant information which is not relevant to the user query. "
-        #     "You must cite the specific Document ID exactly as in the context provided. "
-        #     "For example, if the Document ID is 'PMC555957.txt', refer to it as 'Document PMC555957' in your answer (without the file extension). "
-        #     "If multiple documents are relevant, cite them explicitly. "
-        #     "Please provide the best possible answer using ONLY the user query given above and the provided context information also given above. "
-        #     "Do not mention your chain of thought. "
-        #     "If the info is insufficient, say so."
-        # )
 
         answer = await call_llm(final_prompt)
 
-        # 5) Cache in Redis
+        # 7) Cache in Redis
         store_query_in_redis(query_emb, answer)
         return answer
+
+    def _search_with_offset(self, query_emb: np.ndarray, batch_size: int, offset: int):
+        """
+        This internal helper function uses 'from' and 'size' to retrieve
+        documents from OpenSearch in a paginated manner, so we can read them in small batches.
+        """
+        if not self.os_indexer or query_emb.size == 0:
+            return []
+
+        q_norm = np.linalg.norm(query_emb, axis=1, keepdims=True)
+        normalized_emb = query_emb / (q_norm + 1e-9)
+        vector = normalized_emb[0].tolist()
+        # We use the 'knn' + 'from' and 'size' approach.
+        # Alternatively, could do a normal 'script_score' approach or find a workaround.
+        # If pure KNN doesn't allow offset, can do a different approach or ignore 'offset' for now.
+
+        query_body = {
+            "size": batch_size,
+            "from": offset,
+            "query": {
+                "knn": {
+                    "embedding": {
+                        "vector": vector,
+                        "k": batch_size + offset,  # an approximation
+                    }
+                }
+            },
+        }
+        try:
+            resp = self.os_indexer.client.search(
+                index=self.os_indexer.index_name, body=query_body
+            )
+            hits = resp["hits"]["hits"]
+            results = []
+            for h in hits:
+                doc_score = h["_score"]
+                doc_source = h["_source"]
+                results.append((doc_source, float(doc_score)))
+            return results
+        except Exception as e:
+            print(f"[search_with_offset] Error: {e}")
+            return []
 
 
 # ==============================================================================
 # FastAPI Application Setup
 # ==============================================================================
 app = FastAPI(
-    title="RAG with LLMs + OpenSearch + Redis",
-    version="3.1",
-    description="RAG pipeline to answer queries using Ollama's embedding, OpenAI LLM, OpenSearch ANN, & Redis cache.",
+    title="RAG with LLMs + OpenSearch + Redis + spaCy Classification",
+    version="3.2",
+    description="RAG pipeline to answer queries using Ollama's embedding, OpenAI LLM, OpenSearch ANN, Redis cache, and spaCy text categorization.",
 )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[Lifespan] Initializing RAGModel...")
+    print("[Lifespan] Initializing spaCy text-cat model + RAGModel...")
+    global spacy_textcat_nlp
     global rag_model
+
+    # Load spaCy text-cat model
+    try:
+        spacy_textcat_nlp = spacy.load(SPACY_MODEL_PATH)
+        print("[Lifespan] spaCy text-cat model loaded successfully.")
+    except Exception as e:
+        print(f"[Lifespan] Failed to load spaCy text-cat model: {e}")
+        spacy_textcat_nlp = None
+
     rag_model = RAGModel()
     await rag_model.build_embeddings_from_scratch(PMC_DIR)
     print("[Lifespan] RAGModel is ready.")
-    yield
+
+    yield  # run the application
+
     print("[Lifespan] Server is shutting down...")
 
 
@@ -525,15 +699,18 @@ async def search_opensearch_route(query: str = Body(...), top_k: int = 5):
     if not rm:
         return {"error": "RAGModel not initialized."}
 
+    # We can also run text classification here if we want to set top_k
+    predicted_cat = classify_query(query)
+    effective_top_k = CATEGORY_TOPK_MAP.get(predicted_cat, top_k)
+
     # Embed query text
     q_emb = await embed_query(query)
-
-    # Offload synchronous OS search to a thread
     loop = asyncio.get_running_loop()
-    results = await loop.run_in_executor(None, rm.os_search, q_emb, top_k)
+    results = await loop.run_in_executor(None, rm.os_search, q_emb, effective_top_k)
     return {
         "query": query,
-        "top_k": top_k,
+        "predicted_category": predicted_cat,
+        "top_k": effective_top_k,
         "results": [
             {"doc_id": r[0]["doc_id"], "text": r[0]["text"], "score": r[1]}
             for r in results
@@ -544,7 +721,8 @@ async def search_opensearch_route(query: str = Body(...), top_k: int = 5):
 @app.post("/ask")
 async def ask_route(query: str = Body(...), top_k: int = 5):
     """
-    API endpoint that processes a user query through the entire RAG pipeline.
+    API endpoint that processes a user query through the entire RAG pipeline:
+    classification + embedding + knn-search + LLM generation.
     """
     rm = get_rag_model()
     if not rm:

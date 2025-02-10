@@ -3,3 +3,7 @@ __pycache__/
 .venv/
 relevant_SS
 rag_env
+datasets
+distilbert*
+model_nlu
+training_checkpoint.json
