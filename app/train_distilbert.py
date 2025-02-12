@@ -23,16 +23,12 @@ CHECKPOINT_FILE = CHECKPOINT_DIR / "training_checkpoint.json"
 FINAL_MODEL_DIR = PARENT_DIR / "distilbert_intent_final"
 ONNX_MODEL_PATH = str(PARENT_DIR / "distilbert_intent.onnx")
 
-#########################
-# DATASET DIRECTORY     #
-#########################
+# Dataset directory
 DATA_DIR = Path(
     "/Users/user-home/Downloads/semantic-query-engine/datasets/query_label_datasets/two_M_samples"
 )
 
-#########################
-# TRAINING PARAMETERS   #
-#########################
+# Training parameters/constants
 EPOCHS = 2
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-4

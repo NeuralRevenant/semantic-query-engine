@@ -32,8 +32,4 @@ psycopg2-binary  # PostgreSQL connector for pgvector
 
 # Model Optimization for Apple Silicon
 optimum==1.12.0   # For quantization and performance optimization on Apple M1/M2
-accelerate==0.24.1  # Optimizes model performance on MPS (Apple GPU)
-
-# Optional Monitoring & Debugging
-rich==13.7.0
-loguru==0.7.2
+accelerate>=0.26.0  # Optimizes model performance on MPS (Apple GPU)

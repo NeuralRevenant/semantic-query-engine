@@ -3,207 +3,384 @@ import json
 import numpy as np
 from typing import List, Tuple, Optional, Dict, Any
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Body
 import uvicorn
+
+# ------------------------------------------------------------------------------
+# Redis
+# ------------------------------------------------------------------------------
 import redis
 
+# ------------------------------------------------------------------------------
+# OpenSearch
+# ------------------------------------------------------------------------------
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
 
-import asyncio
-from contextlib import asynccontextmanager
+# ------------------------------------------------------------------------------
+# PostgreSQL
+# ------------------------------------------------------------------------------
+import psycopg2
+from psycopg2.extras import DictCursor
 
-import httpx  # for Ollama's embedding calls
-import openai  # for GPT-4o generation
+# ------------------------------------------------------------------------------
+# Transformers (for embeddings)
+# ------------------------------------------------------------------------------
+import torch
+from torch.amp import autocast
+from transformers import AutoTokenizer, AutoModel
 
-import spacy  # Load the spaCy text categorizer
-from spacy.tokens import Doc
+# ------------------------------------------------------------------------------
+# spaCy
+# ------------------------------------------------------------------------------
+import spacy
+
+# ------------------------------------------------------------------------------
+# HTTP client for remote LLM calls
+# ------------------------------------------------------------------------------
+import httpx
 
 # ==============================================================================
 # Configuration Constants
 # ==============================================================================
-
-# Ollama specifics for embeddings
-OLLAMA_API_URL = "http://localhost:11434/api"
-EMBED_MODEL_NAME = "jina/jina-embeddings-v2-base-de"  # local Ollama embedding model
-
-# OpenAI specifics for generation
-OPENAI_API_KEY = os.getenv(
-    "OPENAI_API_KEY",
-    "",
-)
-openai.api_key = OPENAI_API_KEY
-OPENAI_CHAT_MODEL = "gpt-4o"
-
-BATCH_SIZE = 128
-CHUNK_SIZE = 512
-EMBED_DIM = 768
-MAX_EMBED_CONCURRENCY = 5  # Concurrency limit to avoid overwhelming Ollama
-
+# Redis
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
-MAX_QUERY_CACHE = 1000
-CACHE_SIM_THRESHOLD = 0.96  # Cosine similarity threshold for cache lookup
 
-PMC_DIR = "./PMC"
+# We maintain a maximum number of cached items.
+# When exceeded, remove the least frequently used one.
+REDIS_MAX_ITEMS = 1000
+REDIS_CACHE_LIST = "query_cache_lfu"
 
-# We load the text-cat model from a local directory (adjust path if needed).
-SPACY_MODEL_PATH = "./model_nlu"
+# Embeddings
+EMBED_DIM = 768
+CHUNK_SIZE = 512
+BATCH_SIZE = 128
 
-# ==============================================================================
-# Redis Client & Cache Functions
-# ==============================================================================
-redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
+# ------------------------------
+# Device Selection for Embeddings
+# ------------------------------
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+    inference_dtype = torch.float16  # Faster on most NVIDIA GPUs
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+    inference_dtype = torch.float16  # MPS supports float16 as well
+else:
+    device = torch.device("cpu")
+    inference_dtype = torch.float32  # CPU => stick to float32
 
+# BioBERT model name (PubMed + MIMIC)
+BIOBERT_MODEL_NAME = "dmis-lab/biobert-v1.1"
 
-def store_query_in_redis(query_emb: np.ndarray, response: str):
-    """Store a query embedding and its response in Redis."""
-    emb_list = query_emb.tolist()[0]
-    entry = {"embedding": emb_list, "response": response}
-    redis_client.lpush("query_cache", json.dumps(entry))
-    redis_client.ltrim("query_cache", 0, MAX_QUERY_CACHE - 1)
+# Remote LLM endpoint
+REMOTE_LLM_URL = os.getenv("REMOTE_LLM_URL", "")
 
+# PostgreSQL
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+POSTGRES_DB = os.getenv("POSTGRES_DB", "")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
 
-def find_similar_query_in_redis(query_emb: np.ndarray) -> Optional[str]:
-    """Search Redis for an embedding similar enough to query_emb and return the cached response if found."""
-    cached_list = redis_client.lrange("query_cache", 0, MAX_QUERY_CACHE - 1)
-    query_vec = query_emb[0]
-
-    best_sim = -1.0
-    best_response = None
-
-    for c in cached_list:
-        entry = json.loads(c)
-        emb_list = entry["embedding"]
-        cached_emb = np.array(emb_list, dtype=np.float32)
-        sim = cosine_similarity(query_vec, cached_emb)
-        if sim > best_sim:
-            best_sim = sim
-            best_response = entry["response"]
-
-    if best_sim >= CACHE_SIM_THRESHOLD:
-        return best_response
-
-    return None
-
-
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Compute cosine similarity between two 1-D arrays."""
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a == 0.0 or norm_b == 0.0:
-        return 0.0
-
-    return float(np.dot(a, b) / (norm_a * norm_b))
-
-
-# ==============================================================================
-# Asynchronous Ollama API Functions
-# ==============================================================================
-async def ollama_embed_text(text: str, model: str = EMBED_MODEL_NAME) -> List[float]:
-    """
-    Request an embedding for `text` from Ollama via HTTP POST.
-    Expects JSON of form {"model": model, "prompt": text} and returns {"embedding": [...]}
-    """
-    async with httpx.AsyncClient() as client:
-        payload = {"model": model, "prompt": text, "stream": False}
-        resp = await client.post(
-            f"{OLLAMA_API_URL}/embeddings", json=payload, timeout=30.0
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        # print(f"Embedding generated = {data.get('embedding', 'No embedding field')}")
-        return data.get("embedding", [])
-
-
-async def embed_texts_in_batches(texts: List[str], batch_size: int = 32) -> np.ndarray:
-    """
-    Embeds a list of texts in smaller batches, respecting concurrency limits.
-    """
-    if not texts:
-        return np.array([])
-
-    all_embeddings = []
-    concurrency_sem = asyncio.Semaphore(MAX_EMBED_CONCURRENCY)
-
-    # Process texts in batches
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-
-        async def embed_single(txt: str) -> List[float]:
-            async with concurrency_sem:
-                return await ollama_embed_text(txt)
-
-        tasks = [embed_single(txt) for txt in batch]
-        batch_embeddings = await asyncio.gather(*tasks)
-        all_embeddings.extend(batch_embeddings)
-
-    return np.array(all_embeddings, dtype=np.float32)
-
-
-async def embed_query(query: str) -> np.ndarray:
-    """Obtain an embedding for a single query from Ollama (local)."""
-    if not query.strip():
-        return np.array([])
-
-    emb = await ollama_embed_text(query, EMBED_MODEL_NAME)
-    return np.array([emb], dtype=np.float32)
-
-
-# ==============================================================================
-# OpenAI for Remote Generation
-# ==============================================================================
-async def openai_generate_text(
-    prompt: str,
-    model: str = OPENAI_CHAT_MODEL,
-    temperature: float = 0.6,
-    max_tokens: int = 256,
-) -> str:
-    """
-    Request text generation from the new openai.chat.completions interface.
-    Returns the generated text content.
-    """
-    loop = asyncio.get_running_loop()
-
-    def _run_openai():
-        response = openai.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a helpful assistant. Follow the user's instructions exactly.\n"
-                        "If you reference a document, use the phrase 'Document <ID>' without file extensions.\n"
-                        "Do not reveal your chain of thought."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        # Extract and return the content of the first completion
-        return response.choices[0].message.content.strip()
-
-    # Offload the synchronous call to a thread pool to avoid blocking
-    return await loop.run_in_executor(None, _run_openai)
-
-
-async def call_llm(prompt: str) -> str:
-    """
-    A wrapper function for the answer generation step using OpenAI.
-    """
-    return await openai_generate_text(prompt)
-
-
-# ==============================================================================
-# OpenSearch Setup with HNSW ANN
-# ==============================================================================
+# OpenSearch
 OPENSEARCH_HOST = os.environ.get("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT = int(os.environ.get("OPENSEARCH_PORT", 9200))
 OPENSEARCH_INDEX_NAME = "medical-search-index"
 
+# Directory for local text files
+PMC_DIR = ""
+
+# ==============================================================================
+# Redis LFU Cache
+# ==============================================================================
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+def lfu_cache_get(query_emb: np.ndarray) -> Optional[str]:
+    """
+    Retrieve from Redis if we find a sufficiently similar embedding.
+    Increase freq if found.
+    """
+    cached_list = redis_client.lrange(REDIS_CACHE_LIST, 0, -1)
+    if not cached_list:
+        return None
+
+    # Flatten to 1D for comparison
+    query_vec = query_emb[0]
+    best_sim = -1.0
+    best_index = -1
+    best_entry_data = None
+
+    for i, item in enumerate(cached_list):
+        entry = json.loads(item)
+        emb_list = entry["embedding"]
+        freq = entry.get("freq", 1)
+
+        cached_emb = np.array(emb_list, dtype=np.float32)
+        sim = cosine_similarity(query_vec, cached_emb)
+        if sim > best_sim:
+            best_sim = sim
+            best_index = i
+            best_entry_data = entry
+
+    # Define a threshold
+    if best_sim < 0.96:
+        return None
+
+    if best_entry_data:
+        # increment freq
+        best_entry_data["freq"] = best_entry_data.get("freq", 1) + 1
+        # update entry
+        redis_client.lset(REDIS_CACHE_LIST, best_index, json.dumps(best_entry_data))
+        return best_entry_data["response"]
+
+    return None
+
+
+def _remove_least_frequent_item():
+    cached_list = redis_client.lrange(REDIS_CACHE_LIST, 0, -1)
+    if not cached_list:
+        return
+
+    min_freq = float("inf")
+    min_index = -1
+    for i, item in enumerate(cached_list):
+        entry = json.loads(item)
+        freq = entry.get("freq", 1)
+        if freq < min_freq:
+            min_freq = freq
+            min_index = i
+
+    if min_index >= 0:
+        item_str = cached_list[min_index]
+        redis_client.lrem(REDIS_CACHE_LIST, 1, item_str)
+
+
+def lfu_cache_put(query_emb: np.ndarray, response: str):
+    """
+    Insert new entry, remove LFU if over capacity.
+    """
+    entry = {"embedding": query_emb.tolist()[0], "response": response, "freq": 1}
+    current_len = redis_client.llen(REDIS_CACHE_LIST)
+    if current_len >= REDIS_MAX_ITEMS:
+        _remove_least_frequent_item()
+
+    redis_client.lpush(REDIS_CACHE_LIST, json.dumps(entry))
+
+
+# ==============================================================================
+# PostgreSQL
+# ==============================================================================
+def get_postgres_connection():
+    return psycopg2.connect(
+        dbname=POSTGRES_DB,
+        user=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
+        host=POSTGRES_HOST,
+        port=POSTGRES_PORT,
+        cursor_factory=DictCursor,
+    )
+
+
+def find_most_recent_papers(limit: int = 5) -> List[Dict[str, Any]]:
+    query = f"""
+        SELECT id, title, abstract, publication_date
+        FROM papers
+        ORDER BY publication_date DESC
+        LIMIT {limit}
+    """
+    try:
+        conn = get_postgres_connection()
+        with conn.cursor() as cur:
+            cur.execute(query)
+            rows = cur.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print("[Postgres] find_most_recent_papers error:", e)
+        return []
+
+
+def find_highly_cited_papers(limit: int = 5) -> List[Dict[str, Any]]:
+    query = f"""
+        SELECT id, title, abstract, citation_count
+        FROM papers
+        ORDER BY citation_count DESC
+        LIMIT {limit}
+    """
+    try:
+        conn = get_postgres_connection()
+        with conn.cursor() as cur:
+            cur.execute(query)
+            rows = cur.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print("[Postgres] find_highly_cited_papers error:", e)
+        return []
+
+
+# ==============================================================================
+# spaCy for Intent Classification
+# ==============================================================================
+print("[Load] Attempting spaCy text-cat model...")
+SPACY_MODEL_PATH = "./model_nlu"
+spacy_textcat_nlp: Optional[spacy.Language] = None
+try:
+    spacy_textcat_nlp = spacy.load(SPACY_MODEL_PATH)
+    print("[Load] spaCy loaded successfully.")
+except Exception as ex:
+    print("[Warning] spaCy load error:", ex)
+    spacy_textcat_nlp = None
+
+
+def spacy_classify(query: str) -> Optional[str]:
+    if spacy_textcat_nlp is None:
+        return None
+
+    doc = spacy_textcat_nlp(query)
+    if not doc.cats:
+        return None
+
+    # pick best
+    return max(doc.cats, key=doc.cats.get)
+
+
+def fallback_classify(query: str) -> str:
+    # Simple heuristics if spaCy fails
+    qlower = query.lower()
+    if "recent" in qlower:
+        return "find_most_recent"
+    elif "cited" in qlower:
+        return "find_highly_cited"
+    elif "count" in qlower:
+        return "count_documents"
+
+    return "retrieve_info"
+
+
+def combined_intent_classification(query: str) -> str:
+    label_spacy = spacy_classify(query)
+    if label_spacy:
+        return label_spacy
+
+    return fallback_classify(query)
+
+
+# Maps classification => how many docs to retrieve from OpenSearch
+CATEGORY_TOPK_MAP = {
+    "count_documents": 100,
+    "retrieve_info": 5,
+    "find_most_recent": 5,
+    "find_highly_cited": 10,
+    "other": 5,
+}
+
+# ==============================================================================
+# BioBERT for Embeddings (Optimized, Balanced Accuracy)
+# ==============================================================================
+print("[Load] Initializing BioBERT for embeddings:", BIOBERT_MODEL_NAME)
+biobert_tokenizer = AutoTokenizer.from_pretrained(BIOBERT_MODEL_NAME)
+
+# Load the model in mixed precision if GPU is available, else float32 on CPU
+biobert_model = AutoModel.from_pretrained(
+    BIOBERT_MODEL_NAME,
+    torch_dtype=inference_dtype,
+).to(device)
+biobert_model.eval()
+
+
+@torch.inference_mode()
+def embed_text_bert(text: str) -> np.ndarray:
+    """
+    Generate a single 768-d vector from BioBERT via mean pooling.
+    We run the forward pass in half precision on GPUs (float16) or float32 on CPU.
+    Final embedding is stored in float32 to preserve similarity accuracy.
+    """
+    if not text.strip():
+        return np.zeros((EMBED_DIM,), dtype=np.float32)
+
+    inputs = biobert_tokenizer(
+        text, return_tensors="pt", truncation=True, max_length=512
+    ).to(device)
+
+    # Only enable autocast if we are on CUDA (NVIDIA) GPU (since its not supported on MPS at the moment):
+    cast_enabled = device.type == "cuda"
+
+    # Use autocast on CUDA, do nothing on MPS or CPU
+    if cast_enabled:
+        # Mixed precision on NVIDIA GPU
+        with autocast("cuda", enabled=True):
+            outputs = biobert_model(**inputs)
+    else:
+        # No autocast if MPS or CPU
+        outputs = biobert_model(**inputs)
+
+    # Mean pooling
+    hidden = outputs.last_hidden_state  # shape: [1, seq_len, 768]
+    emb = hidden.mean(dim=1).squeeze()  # shape: [768]
+
+    # Move back to CPU and convert to float32
+    emb_np = emb.detach().cpu().numpy().astype(np.float32)
+    return emb_np
+
+
+def embed_query_bert(query: str) -> np.ndarray:
+    emb = embed_text_bert(query)
+    return np.expand_dims(emb, axis=0)
+
+
+# ==============================================================================
+# Remote LLM Call
+# ==============================================================================
+async def call_remote_llm(
+    context_text: str, user_query: str, max_tokens: int = 200
+) -> str:
+    """
+    Calls the remote LLM endpoint (TGI or custom) with context + query,
+    returns the final answer. We use httpx for async request.
+
+    Expecting the remote service to parse:
+      {
+        "context": <string>,
+        "query": <string>,
+        "max_new_tokens": ...
+      }
+
+    and return JSON: {"answer": "..."}
+    """
+    payload = {
+        "context": context_text,
+        "query": user_query,
+        "max_new_tokens": max_tokens,
+    }
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(REMOTE_LLM_URL, json=payload, timeout=30.0)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["answer"]
+        except Exception as e:
+            print("[Remote LLM] Error:", e)
+            return "Sorry, the remote LLM is unavailable."
+
+
+# ==============================================================================
+# OpenSearch Setup
+# ==============================================================================
 os_client: Optional[OpenSearch] = None
+
 try:
     os_client = OpenSearch(
         hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
@@ -213,7 +390,7 @@ try:
         connection_class=RequestsHttpConnection,
     )
     info = os_client.info()
-    print(f"[INFO] Connected to OpenSearch: {info['version']}")
+    print("[OpenSearch] Connected:", info["version"])
 
     if not os_client.indices.exists(OPENSEARCH_INDEX_NAME):
         index_body = {
@@ -229,30 +406,22 @@ try:
                             "name": "hnsw",
                             "engine": "nmslib",
                             "space_type": "cosinesimil",
-                            "parameters": {
-                                "m": 32,
-                                "ef_construction": 400,
-                                "ef_search": 200,
-                            },
+                            "parameters": {"m": 32, "ef_construction": 400},
                         },
                     },
                 }
             },
         }
         resp = os_client.indices.create(index=OPENSEARCH_INDEX_NAME, body=index_body)
-        print(f"[INFO] Created '{OPENSEARCH_INDEX_NAME}' index with HNSW: {resp}")
+        print("[OpenSearch] Created index:", resp)
     else:
-        print(f"[INFO] OpenSearch index '{OPENSEARCH_INDEX_NAME}' is ready.")
+        print(f"[OpenSearch] Index '{OPENSEARCH_INDEX_NAME}' ready.")
 except Exception as e:
-    print(f"[WARNING] OpenSearch not initialized: {e}")
+    print("[OpenSearch] Initialization error:", e)
     os_client = None
 
 
 class OpenSearchIndexer:
-    """
-    Index documents with embeddings into OpenSearch using the HNSW algorithm.
-    """
-
     def __init__(self, client: OpenSearch, index_name: str):
         self.client = client
         self.index_name = index_name
@@ -261,138 +430,100 @@ class OpenSearchIndexer:
         if not self.client:
             return False
         try:
-            resp = self.client.count(index=self.index_name)
-            return resp["count"] > 0
-        except Exception:
+            c = self.client.count(index=self.index_name)
+            return c["count"] > 0
+        except:
             return False
 
     def add_embeddings(self, embeddings: np.ndarray, docs: List[Dict[str, str]]):
         if not self.client or embeddings.size == 0:
-            print("[OpenSearchIndexer] No embeddings or no OpenSearch client.")
             return
-
         actions = []
-        # Normalize each embedding vector for cosine similarity
+
+        # Normalize embeddings for better KNN search
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         embeddings = embeddings / (norms + 1e-9)
 
-        for i, (doc_dict, emb) in enumerate(zip(docs, embeddings)):
-            doc_id = doc_dict["doc_id"]
-            text_content = doc_dict["text"]
-            actions.append(
-                {
-                    "_op_type": "index",
-                    "_index": self.index_name,
-                    "_id": f"{doc_id}_{i}",
-                    "_source": {
-                        "doc_id": doc_id,
-                        "text": text_content,
-                        "embedding": emb.tolist(),
-                    },
-                }
-            )
+        for i, (doc, emb) in enumerate(zip(docs, embeddings)):
+            doc_id = doc["doc_id"]
+            text_content = doc["text"]
+            action = {
+                "_op_type": "index",
+                "_index": self.index_name,
+                "_id": f"{doc_id}_{i}",
+                "_source": {
+                    "doc_id": doc_id,
+                    "text": text_content,
+                    "embedding": emb.tolist(),
+                },
+            }
+            actions.append(action)
             if len(actions) >= BATCH_SIZE:
                 self._bulk_index(actions)
                 actions = []
+
         if actions:
             self._bulk_index(actions)
 
     def _bulk_index(self, actions):
         try:
             success, errors = bulk(self.client, actions)
-            print(f"[OpenSearchIndexer] Inserted {success} docs, errors={errors}")
+            print(f"[OpenSearchIndexer] Bulk indexed {success}, errors={errors}")
         except Exception as e:
-            print(f"[OpenSearchIndexer] Bulk indexing error: {e}")
+            print("[OpenSearchIndexer] Bulk error:", e)
 
     def search(
         self, query_emb: np.ndarray, k: int = 5
-    ) -> List[Tuple[Dict[str, str], float]]:
+    ) -> List[Tuple[Dict[str, Any], float]]:
         if not self.client or query_emb.size == 0:
             return []
-
         q_norm = np.linalg.norm(query_emb, axis=1, keepdims=True)
         query_emb = query_emb / (q_norm + 1e-9)
         vector = query_emb[0].tolist()
+
         query_body = {
             "size": k,
             "query": {"knn": {"embedding": {"vector": vector, "k": k}}},
         }
+        # query_body = {
+        #     "knn": {
+        #         "field": "embedding",  # The field where the vectors are stored
+        #         "query_vector": vector,  # The normalized query vector
+        #         "k": k,  # Number of nearest neighbors to return
+        #         "num_candidates": 200,  # Controls search depth (improves accuracy)
+        #     }
+        # }
+
         try:
             resp = self.client.search(index=self.index_name, body=query_body)
+            # resp = self.client.transport.perform_request(
+            #     method="POST", url=f"/{self.index_name}/_knn_search", body=query_body
+            # )
             hits = resp["hits"]["hits"]
-            results = []
-            for h in hits:
-                doc_score = h["_score"]
-                doc_source = h["_source"]
-                results.append((doc_source, float(doc_score)))
-
-            print(
-                f"[OpenSearchIndexer] Found {len(results)} relevant results in search."
-            )
-            return results
+            return [(h["_source"], float(h["_score"])) for h in hits]
         except Exception as e:
-            print(f"[OpenSearchIndexer] Search error: {e}")
+            print("[OpenSearchIndexer] Search error:", e)
             return []
 
 
 # ==============================================================================
-# Basic Pre-processing Functions
+# Basic Utils
 # ==============================================================================
 def basic_cleaning(text: str) -> str:
     return text.replace("\n", " ").strip()
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
-    """
-    Splits text into chunks by word count.
-    """
     words = text.split()
-    chunks = []
+    out = []
     for i in range(0, len(words), chunk_size):
         chunk = " ".join(words[i : i + chunk_size])
-        chunks.append(chunk.strip())
-    return chunks
+        out.append(chunk.strip())
+    return out
 
 
 # ==============================================================================
-# SpaCy Classification
-# ==============================================================================
-spacy_textcat_nlp = None
-
-
-def classify_query(query: str) -> str:
-    """
-    Classifies the user query using the loaded spaCy text-cat model.
-    Returns the best label, or 'retrieve_info' fallback if the model isn't loaded.
-    """
-    if not spacy_textcat_nlp:
-        return "retrieve_info"  # default if model missing
-    doc = spacy_textcat_nlp(query)
-    cats = doc.cats
-    best_label = max(cats, key=cats.get)
-    return best_label
-
-
-# A mapping from category -> top_k
-CATEGORY_TOPK_MAP = {
-    "count_documents": 100,
-    "retrieve_info": 5,
-    "summarize_documents": 5,
-    "compare_topics": 5,
-    "list_documents": 20,
-    "extract_specific_info": 5,
-    "answer_directly": 3,
-    "find_most_recent": 5,
-    "find_highly_cited": 10,
-    "document_metadata": 10,
-    "document_references": 10,
-    "filter_by_condition": 5,
-    "find_similar_documents": 5,
-}
-
-
-# ==============================================================================
-# RAG Model
+# RAGModel
 # ==============================================================================
 class RAGModel:
     def __init__(self):
@@ -401,336 +532,226 @@ class RAGModel:
             self.os_indexer = OpenSearchIndexer(os_client, OPENSEARCH_INDEX_NAME)
 
     async def build_embeddings_from_scratch(self, pmc_dir: str):
-        """
-        Reads text files from the given directory, splits them into chunks, obtains embeddings via Ollama,
-        and indexes them in OpenSearch.
-        """
         if not self.os_indexer:
-            print("[RAGModel] No OpenSearchIndexer => cannot build embeddings.")
+            print("[RAGModel] No OpenSearch client => cannot index.")
             return
 
         if self.os_indexer.has_any_data():
-            print("[RAGModel] OpenSearch already has data. Skipping embedding.")
+            print("[RAGModel] OpenSearch has data, skipping re-embedding.")
             return
 
-        print("[RAGModel] Building embeddings from scratch...")
-        data_files = os.listdir(pmc_dir)
-        all_docs = []
-
-        for fname in data_files:
+        print("[RAGModel] Building embeddings from local text...")
+        files = os.listdir(pmc_dir)
+        docs = []
+        for fname in files:
             if fname.startswith("PMC") and fname.endswith(".txt"):
                 path = os.path.join(pmc_dir, fname)
                 try:
                     with open(path, "r", encoding="utf-8") as f:
-                        text = f.read()
+                        raw_text = f.read()
                 except UnicodeDecodeError:
                     with open(path, "r", encoding="latin-1") as f:
-                        text = f.read()
+                        raw_text = f.read()
 
-                cleaned_text = basic_cleaning(text)
-                text_chunks = chunk_text(cleaned_text, CHUNK_SIZE)
-                for chunk_str in text_chunks:
-                    all_docs.append({"doc_id": fname, "text": chunk_str})
+                cleaned = basic_cleaning(raw_text)
+                chunks = chunk_text(cleaned, CHUNK_SIZE)
+                for c in chunks:
+                    docs.append({"doc_id": fname, "text": c})
 
-        if not all_docs:
-            print("[RAGModel] No text found in directory. Exiting.")
+        if not docs:
+            print("[RAGModel] No local docs found.")
             return
 
-        print(f"[RAGModel] Generating embeddings for {len(all_docs)} chunks...")
-        chunk_texts = [d["text"] for d in all_docs]
+        print(f"[RAGModel] Embedding {len(docs)} text chunks with BioBERT...")
+        embed_list = []
+        for d in docs:
+            emb = embed_text_bert(d["text"])
+            embed_list.append(emb)
 
-        # Use batch-based embedding approach with concurrency control
-        embs = await embed_texts_in_batches(chunk_texts, batch_size=32)
+        embed_array = np.array(embed_list, dtype=np.float32)
+        self.os_indexer.add_embeddings(embed_array, docs)
+        print("[RAGModel] Finished indexing in OpenSearch.")
 
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self.os_indexer.add_embeddings, embs, all_docs)
-        print("[RAGModel] Finished embedding & indexing data in OpenSearch.")
-
-    def os_search(self, query_emb: np.ndarray, top_k=5):
+    def os_search(self, query_emb: np.ndarray, top_k: int = 5):
         if not self.os_indexer:
             return []
 
         return self.os_indexer.search(query_emb, k=top_k)
 
     async def ask(self, query: str, top_k: int = 5) -> str:
-        """
-        Process a user query:
-          1. Get its embedding via Ollama
-          2. Check Redis cache and if found return the response
-          3. Classify the query with the spaCy model
-          4. Adjust top_k or other logic based on classification
-          5. If not cached in Redis, search OpenSearch
-          6. Call LLM for the final answer
-          7. Cache and return the answer
-        """
         if not query.strip():
             return "[ERROR] Empty query."
 
-        # 1) Embed query
-        query_emb = await embed_query(query)
+        # 1) Embed locally with BioBERT
+        q_emb = embed_query_bert(query)
 
-        # 2) Check Redis cache
-        cached_resp = find_similar_query_in_redis(query_emb)
-        if cached_resp is not None:
-            print(
-                "[RAGModel] Found a similar query in Redis cache. Returning cached result."
-            )
-            return cached_resp
+        # 2) Redis LFU cache check
+        cached = lfu_cache_get(q_emb)
+        if cached:
+            print("[RAGModel] Cache hit.")
+            return cached
 
-        # 3) Classify the query with spaCy
-        spacy_cat_label = classify_query(query)
+        # 3) Intent classification => skip LLM if not needed
+        intent_label = combined_intent_classification(query)
+        effective_top_k = CATEGORY_TOPK_MAP.get(intent_label, top_k)
 
-        # If category is count, then do not load the documents them
+        # 4) Handle special cases
+        if intent_label == "find_most_recent":
+            recents = find_most_recent_papers(limit=effective_top_k)
+            if not recents:
+                return "No recent papers found."
 
-        # 4) Adjust the top_k parameter based on the predicted category
-        effective_top_k = CATEGORY_TOPK_MAP.get(spacy_cat_label, top_k)
-        loop = asyncio.get_running_loop()
-
-        if spacy_cat_label == "count_documents":
-            # The user wants to know how many documents talk about a subject
-            # We'll fetch documents in BATCHES and for each batch:
-            # Summarize them in a prompt
-            # Ask the LLM to count how many are truly relevant
-            # Then aggregate these partial counts
-
-            BATCH_SIZE_COUNT = 30
-            doc_offset = 0
-            total_relevant_count = 0
-            all_relevant_docs = []
-
-            while doc_offset < effective_top_k:
-                # We'll retrieve the next batch of documents by specifying the offset in search
-                batch_results = await loop.run_in_executor(
-                    None,
-                    self._search_with_offset,
-                    query_emb,
-                    BATCH_SIZE_COUNT,
-                    doc_offset,
-                )
-                if not batch_results:
-                    # No more results
-                    break
-
-                # Build a chunk of context
-                doc_map = {}
-                for doc_dict, score in batch_results:
-                    doc_id = doc_dict["doc_id"]
-                    text_chunk = doc_dict["text"]
-                    if doc_id not in doc_map:
-                        doc_map[doc_id] = text_chunk
-                    else:
-                        doc_map[doc_id] += "\n" + text_chunk
-
-                # Form a smaller prompt instructing the LLM:
-                #   "Out of these docs, which truly discuss <query subject>? Return count + doc IDs"
-                batch_context = ""
-                for doc_id, doc_content in doc_map.items():
-                    batch_context += f"--- Document: {doc_id} ---\n{doc_content}\n\n"
-
-                count_prompt = (
-                    "You are tasked with counting how many of the following documents truly discuss the user query.\n"
-                    "Return the total count of relevant documents, and list out the Document IDs that are relevant.\n"
-                    "Ignore or discard any irrelevant or partially relevant docs.\n\n"
-                    f"User Query for Counting:\n{query}\n\n"
-                    f"Documents:\n{batch_context}\n\n"
-                    "You must respond in the following JSON format EXACTLY:\n"
-                    "{\n"
-                    '  "relevant_count": <integer>,\n'
-                    '  "doc_ids": ["Doc1","Doc2",...]\n'
-                    "}\n"
-                    "Do not add anything else. Just the JSON in that format."
+            context_text = ""
+            for r in recents:
+                context_text += (
+                    f"--- Paper ID: {r['id']} ---\n"
+                    f"Title: {r['title']}\n"
+                    f"{r['abstract']}\n\n"
                 )
 
-                partial_answer = await call_llm(count_prompt)
-                # Now parse partial_answer JSON
-                try:
-                    partial_data = json.loads(partial_answer)
-                    batch_count = partial_data.get("relevant_count", 0)
-                    batch_docs = partial_data.get("doc_ids", [])
-                    total_relevant_count += batch_count
-                    all_relevant_docs.extend(
-                        batch_docs if isinstance(batch_docs, list) else []
-                    )
-                except json.JSONDecodeError:
-                    # If LLM response is invalid, skip or handle error
-                    pass
+            answer = await remote_summarize(context_text, query)
+            lfu_cache_put(q_emb, answer)
+            return answer
 
-                # Move offset
-                doc_offset += BATCH_SIZE_COUNT
+        elif intent_label == "find_highly_cited":
+            cits = find_highly_cited_papers(limit=effective_top_k)
+            if not cits:
+                return "No highly cited papers found."
 
-            # Now we have total_relevant_count + all_relevant_docs
-            # Build a final answer
-            final_count_response = (
-                f"Found {total_relevant_count} relevant documents that truly discuss your topic.\n"
-                f"Relevant Document IDs: {all_relevant_docs}"
-            )
-            # Cache in Redis
-            store_query_in_redis(query_emb, final_count_response)
-            return final_count_response
+            context_text = ""
+            for c in cits:
+                context_text += (
+                    f"--- Paper ID: {c['id']} ---\n"
+                    f"Title: {c['title']}\n"
+                    f"{c['abstract']}\n\n"
+                )
 
-        # 5) Search OpenSearch for other categories as usual
-        results = await loop.run_in_executor(
-            None, self.os_search, query_emb, effective_top_k
-        )
+            answer = await remote_summarize(context_text, query)
+            lfu_cache_put(q_emb, answer)
+            return answer
 
-        # 6) Prepare context & call LLM
+        elif intent_label == "count_documents":
+            results = self.os_search(q_emb, effective_top_k)
+            doc_ids = set(r[0]["doc_id"] for r in results)
+            final = f"Found {len(doc_ids)} matching docs: {list(doc_ids)}"
+            lfu_cache_put(q_emb, final)
+            return final
+
+        # 5) Otherwise => do KNN search in OpenSearch
+        results = self.os_search(q_emb, effective_top_k)
+        if not results:
+            return "No documents found for your query."
+
+        # Build context from docs
         doc_map = {}
-        for doc_dict, score in results:
-            doc_id = doc_dict["doc_id"]
-            text_chunk = doc_dict["text"]
-            if doc_id not in doc_map:
-                doc_map[doc_id] = text_chunk
+        for doc_source, score in results:
+            d_id = doc_source["doc_id"]
+            if d_id not in doc_map:
+                doc_map[d_id] = doc_source["text"]
             else:
-                doc_map[doc_id] += "\n" + text_chunk
+                doc_map[d_id] += "\n" + doc_source["text"]
 
-        print(f"[OpenSearchIndexer] Found {len(doc_map)} docs in search.")
         context_text = ""
-        for doc_id, doc_content in doc_map.items():
-            context_text += f"--- Document: {doc_id} ---\n{doc_content}\n\n"
-
-        final_prompt = (
-            "INSTRUCTIONS: You must cite the **Document ID or Name** for any information you use. "
-            "Your answer must follow this format: Direct Answer (at most 4 sentences)\nReferences (list any Document IDs from which the answer is extracted, e.g., Document XYZ). "
-            "Your answer must be specific to the user query. "
-            "If the Document ID is 'PMC555957.txt', refer to it as 'Document PMC555957' (no file extension). "
-            "If multiple documents are relevant, cite them explicitly. "
-            "Do NOT reveal your chain of thought.\n\n"
-            f"User Query:\n{query}\n\n"
-            f"Context:\n{context_text}\n"
-            "--- End of context ---\n\n"
-            "Provide your answer strictly based on the above information. If insufficient, say so."
-        )
-
-        answer = await call_llm(final_prompt)
-
-        # 7) Cache in Redis
-        store_query_in_redis(query_emb, answer)
-        return answer
-
-    def _search_with_offset(self, query_emb: np.ndarray, batch_size: int, offset: int):
-        """
-        This internal helper function uses 'from' and 'size' to retrieve
-        documents from OpenSearch in a paginated manner, so we can read them in small batches.
-        """
-        if not self.os_indexer or query_emb.size == 0:
-            return []
-
-        q_norm = np.linalg.norm(query_emb, axis=1, keepdims=True)
-        normalized_emb = query_emb / (q_norm + 1e-9)
-        vector = normalized_emb[0].tolist()
-        # We use the 'knn' + 'from' and 'size' approach.
-        # Alternatively, could do a normal 'script_score' approach or find a workaround.
-        # If pure KNN doesn't allow offset, can do a different approach or ignore 'offset' for now.
-
-        query_body = {
-            "size": batch_size,
-            "from": offset,
-            "query": {
-                "knn": {
-                    "embedding": {
-                        "vector": vector,
-                        "k": batch_size + offset,  # an approximation
-                    }
-                }
-            },
-        }
-        try:
-            resp = self.os_indexer.client.search(
-                index=self.os_indexer.index_name, body=query_body
+        for doc_id, content in doc_map.items():
+            print(doc_id)
+            context_text += (
+                f"--- Document ID: {doc_id} ---\nDocument Content: {content}\n\n"
             )
-            hits = resp["hits"]["hits"]
-            results = []
-            for h in hits:
-                doc_score = h["_score"]
-                doc_source = h["_source"]
-                results.append((doc_source, float(doc_score)))
-            return results
-        except Exception as e:
-            print(f"[search_with_offset] Error: {e}")
-            return []
+
+        final_answer = await remote_answer(context_text, query)
+        lfu_cache_put(q_emb, final_answer)
+        return final_answer
+
+
+async def remote_summarize(context_text: str, user_query: str, max_tokens=200) -> str:
+    prompt_context = (
+        "You are a helpful assistant. Summarize the following results.\n\n"
+        f"Query: {user_query}\n\n"
+        f"Context:\n{context_text}\n\n"
+        "Give a short summary or direct answer, referencing relevant Document IDs or Names if needed.\n"
+    )
+    return await call_remote_llm(
+        context_text=prompt_context, user_query="", max_tokens=max_tokens
+    )
+
+
+async def remote_answer(context_text: str, user_query: str, max_tokens=200) -> str:
+    prompt_context = (
+        "### Instructions:\n"
+        "You are a helpful medical assistant. You have access to the following provided context "
+        "which may contain references to documents (e.g., PMC51123.txt, PMC23124.txt, etc.). "
+        "Your job is to answer the user's question accurately using only this provided information or context and nothing else. "
+        "Mention the document IDs citing the specific term or discussing the subject (from which you extracted the user-query specific information) "
+        "in your answer in the format: Answer Text -> Document ID/Name (without the file extension like '.txt'). "
+        "Do not include the prompt or your chain-of-thought in your response! Only provide the final answer using the provided context and nothing more. "
+        "If there is not enough info, just say so!\n\n"
+        f"### Relevant Information or Context (Documents):\n{context_text}\n\n"
+        # "### Response:\n"
+        "Answer accurately only using this information that was retrieved from the database!"
+    )
+    return await call_remote_llm(
+        context_text=prompt_context, user_query=user_query, max_tokens=max_tokens
+    )
 
 
 # ==============================================================================
-# FastAPI Application Setup
+# FastAPI Setup
 # ==============================================================================
-app = FastAPI(
-    title="RAG with LLMs + OpenSearch + Redis + spaCy Classification",
-    version="3.2",
-    description="RAG pipeline to answer queries using Ollama's embedding, OpenAI LLM, OpenSearch ANN, Redis cache, and spaCy text categorization.",
-)
+app = FastAPI(title="Local RAG + BioBERT + Local DB + Remote LLM)", version="6.0")
+
+rag_model: Optional["RAGModel"] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[Lifespan] Initializing spaCy text-cat model + RAGModel...")
-    global spacy_textcat_nlp
     global rag_model
-
-    # Load spaCy text-cat model
-    try:
-        spacy_textcat_nlp = spacy.load(SPACY_MODEL_PATH)
-        print("[Lifespan] spaCy text-cat model loaded successfully.")
-    except Exception as e:
-        print(f"[Lifespan] Failed to load spaCy text-cat model: {e}")
-        spacy_textcat_nlp = None
-
     rag_model = RAGModel()
+    # Possibly embed local docs if needed
     await rag_model.build_embeddings_from_scratch(PMC_DIR)
-    print("[Lifespan] RAGModel is ready.")
-
-    yield  # run the application
-
-    print("[Lifespan] Server is shutting down...")
+    yield
+    print("[Shutdown] Done.")
 
 
-app.router.lifespan_context = lifespan
-
-
-def get_rag_model() -> RAGModel:
-    return rag_model
-
-
-@app.post("/search/opensearch")
+@app.post("/search")
 async def search_opensearch_route(query: str = Body(...), top_k: int = 5):
-    """
-    API endpoint for performing approximate k-NN search via OpenSearch.
-    """
-    rm = get_rag_model()
+    """Direct OS search endpoint with no LLM usage."""
+    rm = rag_model
     if not rm:
-        return {"error": "RAGModel not initialized."}
+        return {"error": "No RAG model."}
 
-    # We can also run text classification here if we want to set top_k
-    predicted_cat = classify_query(query)
-    effective_top_k = CATEGORY_TOPK_MAP.get(predicted_cat, top_k)
-
-    # Embed query text
-    q_emb = await embed_query(query)
-    loop = asyncio.get_running_loop()
-    results = await loop.run_in_executor(None, rm.os_search, q_emb, effective_top_k)
-    return {
-        "query": query,
-        "predicted_category": predicted_cat,
-        "top_k": effective_top_k,
-        "results": [
-            {"doc_id": r[0]["doc_id"], "text": r[0]["text"], "score": r[1]}
-            for r in results
-        ],
-    }
+    q_emb = embed_query_bert(query)
+    results = rm.os_search(q_emb, top_k)
+    out = []
+    for doc_source, score in results:
+        out.append(
+            {
+                "doc_id": doc_source["doc_id"],
+                "text": doc_source["text"][:200],
+                "score": score,
+            }
+        )
+    return {"query": query, "top_k": top_k, "results": out}
 
 
 @app.post("/ask")
 async def ask_route(query: str = Body(...), top_k: int = 5):
     """
-    API endpoint that processes a user query through the entire RAG pipeline:
-    classification + embedding + knn-search + LLM generation.
+    Full pipeline:
+    1) Embed => 2) Classify => 3) Retrieve => 4) Possibly call remote LLM => Return answer
     """
-    rm = get_rag_model()
-    if not rm:
-        return {"error": "RAG Model not initialized"}
+    if not rag_model:
+        return {"error": "RAG model not initialized."}
 
-    answer = await rm.ask(query, top_k)
+    answer = await rag_model.ask(query, top_k)
     return {"query": query, "answer": answer}
 
+
+@app.get("/healthcheck")
+def health():
+    return {"status": "ok"}
+
+
+app.router.lifespan_context = lifespan
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

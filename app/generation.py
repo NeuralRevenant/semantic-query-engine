@@ -1,44 +1,45 @@
 import os
 import torch
-from torch.cuda.amp import autocast
-from fastapi import FastAPI, Body
+from fastapi import FastAPI
 from pydantic import BaseModel
 import uvicorn
-
-# We can either import pipeline directly, or load the model + tokenizer ourselves.
-from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+from transformers import (
+    pipeline,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+)
 
 ##################################################################
 # 1. Model & Pipeline Setup
 ##################################################################
 
-# The new model
 MODEL_NAME = "ruslanmv/Medical-Llama3-8B"
 
-# Create a text-generation pipeline
-# - device_map="auto" tries to load the model onto available GPU
-# - torch_dtype=torch.float16 for half-precision on GPU
-# - if your GPU memory is limited, you might experiment with load_in_8bit or load_in_4bit (bitsandbytes)
-pipe = pipeline(
-    "text-generation", model=MODEL_NAME, device_map="auto", torch_dtype=torch.float16
+quant_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4",
 )
 
-# (Optional) If you prefer more direct control:
-# tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-# model = AutoModelForCausalLM.from_pretrained(
-#     MODEL_NAME,
-#     device_map="auto",
-#     torch_dtype=torch.float16
-# )
-# pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, device_map="auto")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    device_map="auto",
+    quantization_config=quant_config,
+    torch_dtype=torch.float16,
+)
 
+# Using the default pipeline.
+pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
 
 ##################################################################
 # 2. FastAPI App
 ##################################################################
 app = FastAPI(
     title="GCP LLM Generation Service",
-    description="Runs ruslanmv/Medical-Llama3-8B on an NVIDIA L4 GPU with half-precision.",
+    description="Optimized Medical LLM with concise output, referencing doc IDs as needed.",
     version="1.0",
 )
 
@@ -65,14 +66,13 @@ class GenerationResponse(BaseModel):
 @app.post("/generate", response_model=GenerationResponse)
 def generate_text(req: GenerationRequest):
     """
-    Receives a 'context' + 'query' and returns a short medical answer.
+    Receives a 'context' + 'query' and returns a short medical answer
+    that cites relevant doc IDs without returning the entire prompt.
     """
     prompt = build_prompt(req.context, req.query)
 
-    # Inference with autocast for half precision on CUDA
-    with torch.no_grad(), autocast(
-        device_type="cuda", enabled=torch.cuda.is_available()
-    ):
+    # Use autocast in half-precision for performance
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
         outputs = pipe(
             prompt,
             max_new_tokens=req.max_new_tokens,
@@ -83,36 +83,59 @@ def generate_text(req: GenerationRequest):
             num_return_sequences=1,
         )
 
-    # The pipeline returns a list of generated sequences. We pick the first.
     generated_text = outputs[0]["generated_text"]
-    # Optionally, remove the prompt from the final text or do other post-processing.
-    answer = generated_text.strip()
-    return GenerationResponse(answer=answer)
+
+    print(f"Generated Text: {generated_text}")
+    # Post-processing to remove the prompt or repeated text:
+    # We look for the "### Response:" delimiter below and extract just that portion.
+    answer = extract_model_answer(generated_text, prompt)
+    print(f"Answer Text: {answer}")
+
+    return GenerationResponse(answer=answer.strip())
 
 
 ##################################################################
-# 5. Prompt Construction
+# 5. Improved Prompt Construction
 ##################################################################
 def build_prompt(context: str, query: str) -> str:
     """
-    Combine context + query into a prompt that fits Medical-Llama3-8B's instruction style.
-    Keep it short for sub-second latencies.
+    Build an instruction-style prompt that:
+    - Provides user context with doc IDs.
+    - Asks for a concise answer that references only relevant doc IDs.
+    - Prohibits returning the entire prompt or chain of thought.
     """
     return (
-        "Below is relevant medical context:\n"
-        f"{context}\n\n"
-        "User question:\n"
-        f"{query}\n\n"
-        "Provide a concise, medically accurate answer:\n"
+        f"### User Query (or Question): {query}\n\n"
+        f"### Relevant Information/Context along with the instructions below:\n{context}"
     )
+
+
+def extract_model_answer(generated_text: str, prompt: str) -> str:
+    """
+    A utility to remove the entire prompt portion from the generated text,
+    returning only the model's final portion after '### Response:'.
+    """
+    # Split off everything before '### Response:' if it still appears.
+    # If the model doesn't strictly follow that might need more robust logic.
+    split_marker = "### Response:"
+    if split_marker in generated_text:
+        # Get only what comes after '### Response:'.
+        return generated_text.split(split_marker, 1)[-1]
+    else:
+        # Fallback: remove the initial prompt from the output if present
+        if prompt in generated_text:
+            return generated_text.replace(prompt, "")
+        
+        return generated_text
 
 
 ##################################################################
 # 6. Server Entry Point
 ##################################################################
 if __name__ == "__main__":
-    # Single worker typically recommended for large models
-    # so it doesn't get duplicated in memory.
+    # Tweak CUDA memory allocation behavior if needed
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:true"
+
     uvicorn.run(
         "generation:app",
         host="0.0.0.0",
