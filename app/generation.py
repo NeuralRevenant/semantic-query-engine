@@ -126,6 +126,7 @@ def generate_text(req: GenerationRequest):
             do_sample=True,
             num_return_sequences=1,
             max_length=max_length,
+            truncation=True,
             pad_token_id=tokenizer.eos_token_id,  # Avoid pad token warnings
         )
 
@@ -146,7 +147,7 @@ def build_prompt(context: str, query: str) -> str:
     Build an instruction-style prompt with context & query.
     """
     return (
-        "You are a helpful AI assistant. Use the provided documents' context or information while following every instruction extremely carefully!\n\n"
+        "You are a helpful AI assistant. Use the provided context or information following every instruction given extremely carefully.\n\n"
         f"### Context:\n{context}\n\n"
         # f"### User Query:\n{query}\n\n"
         "### Response:\n"

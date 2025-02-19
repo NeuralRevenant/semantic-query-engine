@@ -101,7 +101,7 @@ POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
 # OpenSearch
 OPENSEARCH_HOST = os.environ.get("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT = int(os.environ.get("OPENSEARCH_PORT", 9200))
-OPENSEARCH_INDEX_NAME = "medical-search-index"
+OPENSEARCH_INDEX_NAME = ""
 
 # Local text files
 PMC_DIR = ""
@@ -736,18 +736,16 @@ async def remote_answer(context_text: str, user_query: str, max_tokens=200) -> s
     # )
 
     prompt_context = (
-        "INSTRUCTIONS: You must cite the **Document ID or Name** for any information you use. "
-        "Your answer must follow this format: Direct Answer (at most 4 sentences)\nReferences (list any Document IDs from which the answer is extracted, e.g., Document XYZ). "
+        "INSTRUCTIONS: You must cite the Document ID or Name for any information you use. "
+        "Your answer must follow this format: Direct Answer (at most 4 sentences). References (list any Document IDs from which the answer is extracted, e.g., Document XYZ). "
         "Your answer must be specific to the user query regardless of the provided context information. "
+        "If insufficient information or if the provided context is not relevant to the user query, then clearly say so instead of giving a false response based on your own knowledge. "
         "If the Document ID is 'PMC555957.txt', refer to it as 'Document PMC555957' (without the file extension). "
         "If multiple documents are relevant, cite each of them explicitly. "
         "Do NOT reveal your reasoning or chain of thought. "
-        "If insufficient information or if the provided context is not relevant to the user query, then say so clearly, but do not give a false response based on your own knowledge of these terms or questions.\n\n"
-        f"User Query:\n{user_query}\n\n"
-        "Context:\n"
-        f"{context_text}\n"
-        "--- End of context ---\n\n"
-        "Provide your answer strictly based on the above information and following all instructions carefully!"
+        "Provide your answer strictly based on the information given below, following every instruction mentioned till now very carefully:\n\n"
+        f"User Query:\n{user_query}\n"
+        f"Provided Context or Information:\n{context_text}\n"
     )
     return await call_remote_llm(
         context_text=prompt_context, user_query="", max_tokens=max_tokens
