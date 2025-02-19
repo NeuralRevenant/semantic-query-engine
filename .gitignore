@@ -7,3 +7,4 @@ datasets
 distilbert*
 model_nlu
 training_checkpoint.json
+RAG*

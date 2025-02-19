@@ -3,6 +3,7 @@ import json
 import numpy as np
 from typing import List, Tuple, Optional, Dict, Any
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Body
@@ -42,6 +43,13 @@ import spacy
 # ------------------------------------------------------------------------------
 import httpx
 
+
+torch.use_deterministic_algorithms(
+    True
+)  # Enforce deterministic CPU/GPU ops where possible
+torch.backends.cudnn.benchmark = False  # Disable auto-benchmark
+# Dropout is disabled in eval mode, so setting model.eval() is crucial.
+
 # ==============================================================================
 # Configuration Constants
 # ==============================================================================
@@ -49,31 +57,36 @@ import httpx
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
 
-# We maintain a maximum number of cached items.
-# When exceeded, remove the least frequently used one.
 REDIS_MAX_ITEMS = 1000
 REDIS_CACHE_LIST = "query_cache_lfu"
 
 # Embeddings
 EMBED_DIM = 768
 CHUNK_SIZE = 512
-BATCH_SIZE = 128
 
-# ------------------------------
-# Device Selection for Embeddings
-# ------------------------------
+# ---- Batching & Concurrency ----
+BATCH_SIZE = 64  # For embedding documents in batches
+MAX_EMBED_CONCURRENCY = (
+    5  # Limit the number of concurrent embedding tasks to avoid GPU overload
+)
+
+
+# Device Selection
 if torch.cuda.is_available():
     device = torch.device("cuda")
     inference_dtype = torch.float16  # Faster on most NVIDIA GPUs
 elif torch.backends.mps.is_available():
     device = torch.device("mps")
-    inference_dtype = torch.float16  # MPS supports float16 as well
+    inference_dtype = torch.float32  # float32 better on MPS
 else:
     device = torch.device("cpu")
     inference_dtype = torch.float32  # CPU => stick to float32
 
-# BioBERT model name (PubMed + MIMIC)
-BIOBERT_MODEL_NAME = "dmis-lab/biobert-v1.1"
+print(f"device: {device.type}")
+print(f"inference data type: {inference_dtype}")
+
+# Model name
+EMBED_MODEL_NAME = "jinaai/jina-embeddings-v2-base-de"
 
 # Remote LLM endpoint
 REMOTE_LLM_URL = os.getenv("REMOTE_LLM_URL", "")
@@ -90,7 +103,7 @@ OPENSEARCH_HOST = os.environ.get("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT = int(os.environ.get("OPENSEARCH_PORT", 9200))
 OPENSEARCH_INDEX_NAME = "medical-search-index"
 
-# Directory for local text files
+# Local text files
 PMC_DIR = ""
 
 # ==============================================================================
@@ -108,15 +121,11 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def lfu_cache_get(query_emb: np.ndarray) -> Optional[str]:
-    """
-    Retrieve from Redis if we find a sufficiently similar embedding.
-    Increase freq if found.
-    """
+    """Retrieve from Redis if we find a sufficiently similar embedding."""
     cached_list = redis_client.lrange(REDIS_CACHE_LIST, 0, -1)
     if not cached_list:
         return None
 
-    # Flatten to 1D for comparison
     query_vec = query_emb[0]
     best_sim = -1.0
     best_index = -1
@@ -134,7 +143,6 @@ def lfu_cache_get(query_emb: np.ndarray) -> Optional[str]:
             best_index = i
             best_entry_data = entry
 
-    # Define a threshold
     if best_sim < 0.96:
         return None
 
@@ -149,6 +157,7 @@ def lfu_cache_get(query_emb: np.ndarray) -> Optional[str]:
 
 
 def _remove_least_frequent_item():
+    """Helper to remove the least frequently used entry from Redis."""
     cached_list = redis_client.lrange(REDIS_CACHE_LIST, 0, -1)
     if not cached_list:
         return
@@ -168,9 +177,7 @@ def _remove_least_frequent_item():
 
 
 def lfu_cache_put(query_emb: np.ndarray, response: str):
-    """
-    Insert new entry, remove LFU if over capacity.
-    """
+    """Insert new entry into the LFU Redis cache."""
     entry = {"embedding": query_emb.tolist()[0], "response": response, "freq": 1}
     current_len = redis_client.llen(REDIS_CACHE_LIST)
     if current_len >= REDIS_MAX_ITEMS:
@@ -193,11 +200,11 @@ def get_postgres_connection():
     )
 
 
-def find_most_recent_papers(limit: int = 5) -> List[Dict[str, Any]]:
+def find_most_recent(limit: int = 5) -> List[Dict[str, Any]]:
     query = f"""
-        SELECT id, title, abstract, publication_date
-        FROM papers
-        ORDER BY publication_date DESC
+        SELECT id, title, abstract, date
+        FROM documents
+        ORDER BY date DESC
         LIMIT {limit}
     """
     try:
@@ -208,14 +215,14 @@ def find_most_recent_papers(limit: int = 5) -> List[Dict[str, Any]]:
         conn.close()
         return [dict(r) for r in rows]
     except Exception as e:
-        print("[Postgres] find_most_recent_papers error:", e)
+        print("[Postgres] find_most_recent error:", e)
         return []
 
 
-def find_highly_cited_papers(limit: int = 5) -> List[Dict[str, Any]]:
+def find_highly_cited(limit: int = 5) -> List[Dict[str, Any]]:
     query = f"""
         SELECT id, title, abstract, citation_count
-        FROM papers
+        FROM documents
         ORDER BY citation_count DESC
         LIMIT {limit}
     """
@@ -227,7 +234,7 @@ def find_highly_cited_papers(limit: int = 5) -> List[Dict[str, Any]]:
         conn.close()
         return [dict(r) for r in rows]
     except Exception as e:
-        print("[Postgres] find_highly_cited_papers error:", e)
+        print("[Postgres] find_highly_cited error:", e)
         return []
 
 
@@ -248,17 +255,14 @@ except Exception as ex:
 def spacy_classify(query: str) -> Optional[str]:
     if spacy_textcat_nlp is None:
         return None
-
     doc = spacy_textcat_nlp(query)
     if not doc.cats:
         return None
-
-    # pick best
     return max(doc.cats, key=doc.cats.get)
 
 
 def fallback_classify(query: str) -> str:
-    # Simple heuristics if spaCy fails
+    """Simple fallback heuristics if spaCy classification fails."""
     qlower = query.lower()
     if "recent" in qlower:
         return "find_most_recent"
@@ -266,7 +270,6 @@ def fallback_classify(query: str) -> str:
         return "find_highly_cited"
     elif "count" in qlower:
         return "count_documents"
-
     return "retrieve_info"
 
 
@@ -274,71 +277,138 @@ def combined_intent_classification(query: str) -> str:
     label_spacy = spacy_classify(query)
     if label_spacy:
         return label_spacy
-
     return fallback_classify(query)
 
 
-# Maps classification => how many docs to retrieve from OpenSearch
 CATEGORY_TOPK_MAP = {
     "count_documents": 100,
-    "retrieve_info": 5,
-    "find_most_recent": 5,
-    "find_highly_cited": 10,
-    "other": 5,
+    "retrieve_info": 3,
+    "find_most_recent": 3,
+    "find_highly_cited": 3,
+    "other": 3,
 }
 
 # ==============================================================================
-# BioBERT for Embeddings (Optimized, Balanced Accuracy)
+# Hugging Face Model + Tokenizer (Jina Embeddings)
 # ==============================================================================
-print("[Load] Initializing BioBERT for embeddings:", BIOBERT_MODEL_NAME)
-biobert_tokenizer = AutoTokenizer.from_pretrained(BIOBERT_MODEL_NAME)
-
-# Load the model in mixed precision if GPU is available, else float32 on CPU
-biobert_model = AutoModel.from_pretrained(
-    BIOBERT_MODEL_NAME,
+print("[Load] Initializing Jina Embeddings:", EMBED_MODEL_NAME)
+embedding_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME)
+embedding_model = AutoModel.from_pretrained(
+    EMBED_MODEL_NAME,
     torch_dtype=inference_dtype,
 ).to(device)
-biobert_model.eval()
+embedding_model.eval()  # IMP: disable dropout & ensures dropout is disabled, so the model doesn't randomly drop neurons
+
+
+def _attention_mask_mean_pool(
+    hidden_states: torch.Tensor, attention_mask: torch.Tensor
+) -> torch.Tensor:
+    """
+    Typical attention-mask mean pooling:
+      sum(token_embeddings * mask) / sum(mask)
+    This often matches how 'sentence-transformers' style models do mean pooling.
+    """
+    input_mask_expanded = (
+        attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
+    )
+    sum_embeddings = torch.sum(hidden_states * input_mask_expanded, dim=1)
+    sum_mask = torch.clamp(input_mask_expanded.sum(dim=1), min=1e-9)
+    return sum_embeddings / sum_mask
 
 
 @torch.inference_mode()
-def embed_text_bert(text: str) -> np.ndarray:
-    """
-    Generate a single 768-d vector from BioBERT via mean pooling.
-    We run the forward pass in half precision on GPUs (float16) or float32 on CPU.
-    Final embedding is stored in float32 to preserve similarity accuracy.
-    """
+def embed_single_text(text: str) -> np.ndarray:
+    """Embed a single text with attention-mask mean pooling in half-precision if NVIDIA CUDA GPU, else float32."""
     if not text.strip():
         return np.zeros((EMBED_DIM,), dtype=np.float32)
 
-    inputs = biobert_tokenizer(
+    inputs = embedding_tokenizer(
         text, return_tensors="pt", truncation=True, max_length=512
     ).to(device)
 
-    # Only enable autocast if we are on CUDA (NVIDIA) GPU (since its not supported on MPS at the moment):
-    cast_enabled = device.type == "cuda"
-
-    # Use autocast on CUDA, do nothing on MPS or CPU
-    if cast_enabled:
-        # Mixed precision on NVIDIA GPU
-        with autocast("cuda", enabled=True):
-            outputs = biobert_model(**inputs)
+    # Use autocast if we are on CUDA NVIDIA GPU for half-precision, otherwise not supported
+    if device.type == "cuda":
+        with autocast(device_type=device.type, enabled=True):
+            outputs = embedding_model(**inputs)
     else:
-        # No autocast if MPS or CPU
-        outputs = biobert_model(**inputs)
+        outputs = embedding_model(**inputs)
 
-    # Mean pooling
-    hidden = outputs.last_hidden_state  # shape: [1, seq_len, 768]
-    emb = hidden.mean(dim=1).squeeze()  # shape: [768]
+    hidden_states = outputs.last_hidden_state  # [1, seq_len, 768]
+    pooled = _attention_mask_mean_pool(hidden_states, inputs["attention_mask"])
 
-    # Move back to CPU and convert to float32
-    emb_np = emb.detach().cpu().numpy().astype(np.float32)
+    # Convert to float32 before NumPy conversion to avoid NaNs
+    emb_np = pooled[0].detach().cpu().to(torch.float32).numpy()
+    # emb_np = pooled[0].detach().cpu().numpy().astype(np.float32)
     return emb_np
 
 
-def embed_query_bert(query: str) -> np.ndarray:
-    emb = embed_text_bert(query)
+def embed_query_jina(query: str) -> np.ndarray:
+    """
+    Embeds a single query for real-time usage (e.g., user queries).
+    """
+    emb = embed_single_text(query)
     return np.expand_dims(emb, axis=0)
+
+
+async def embed_texts_in_batches(texts: List[str], batch_size: int = 32) -> np.ndarray:
+    """
+    Asynchronously embed a list of texts in small batches, using standard attention-mask mean pooling
+    for each batch. We use a semaphore to run up to MAX_EMBED_CONCURRENCY batches in parallel.
+    """
+
+    # If no texts, return an empty array
+    if not texts:
+        return np.empty((0, EMBED_DIM), dtype=np.float32)
+
+    # Split the 'texts' into sub-batches
+    batches = []
+    for i in range(0, len(texts), batch_size):
+        batch_chunk = texts[i : i + batch_size]
+        batches.append(batch_chunk)
+
+    # Create a semaphore to limit concurrency
+    concurrency_sem = asyncio.Semaphore(MAX_EMBED_CONCURRENCY)
+
+    async def embed_one_batch(batch_texts: List[str]) -> np.ndarray:
+        """
+        Embeds a single batch of texts using attention-mask mean pooling.
+        We acquire the semaphore before doing any heavy embedding work.
+        """
+        async with concurrency_sem:
+            # Prepare inputs
+            inputs = embedding_tokenizer(
+                batch_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512,
+            ).to(device)
+
+            with torch.inference_mode():
+                if device.type == "cuda":
+                    with autocast(device_type=device.type, enabled=True):
+                        outputs = embedding_model(**inputs)
+                else:
+                    outputs = embedding_model(**inputs)
+
+            hidden_states = (
+                outputs.last_hidden_state
+            )  # shape: [batch_size, seq_len, 768]
+            # Weighted mean pooling using attention mask
+            pooled = _attention_mask_mean_pool(hidden_states, inputs["attention_mask"])
+
+            # Convert to float32 before NumPy conversion to avoid NaNs
+            # return pooled.detach().cpu().numpy().astype(np.float32)
+            return pooled.detach().cpu().to(torch.float32).numpy()
+
+    # Schedule embedding tasks for each batch
+    tasks = [embed_one_batch(batch) for batch in batches]
+
+    # Gather all batch-embedding results (in parallel, limited by the semaphore)
+    results = await asyncio.gather(*tasks)
+
+    # Concatenate all batch embeddings into one array
+    return np.concatenate(results, axis=0)  # all_embeddings
 
 
 # ==============================================================================
@@ -347,19 +417,6 @@ def embed_query_bert(query: str) -> np.ndarray:
 async def call_remote_llm(
     context_text: str, user_query: str, max_tokens: int = 200
 ) -> str:
-    """
-    Calls the remote LLM endpoint (TGI or custom) with context + query,
-    returns the final answer. We use httpx for async request.
-
-    Expecting the remote service to parse:
-      {
-        "context": <string>,
-        "query": <string>,
-        "max_new_tokens": ...
-      }
-
-    and return JSON: {"answer": "..."}
-    """
     payload = {
         "context": context_text,
         "query": user_query,
@@ -380,7 +437,6 @@ async def call_remote_llm(
 # OpenSearch Setup
 # ==============================================================================
 os_client: Optional[OpenSearch] = None
-
 try:
     os_client = OpenSearch(
         hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
@@ -406,7 +462,7 @@ try:
                             "name": "hnsw",
                             "engine": "nmslib",
                             "space_type": "cosinesimil",
-                            "parameters": {"m": 32, "ef_construction": 400},
+                            "parameters": {"m": 48, "ef_construction": 400},
                         },
                     },
                 }
@@ -438,9 +494,9 @@ class OpenSearchIndexer:
     def add_embeddings(self, embeddings: np.ndarray, docs: List[Dict[str, str]]):
         if not self.client or embeddings.size == 0:
             return
-        actions = []
 
-        # Normalize embeddings for better KNN search
+        actions = []
+        # Normalize for better KNN with cosinesimil
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         embeddings = embeddings / (norms + 1e-9)
 
@@ -458,6 +514,7 @@ class OpenSearchIndexer:
                 },
             }
             actions.append(action)
+            # Bulk-index in increments of BATCH_SIZE
             if len(actions) >= BATCH_SIZE:
                 self._bulk_index(actions)
                 actions = []
@@ -485,20 +542,9 @@ class OpenSearchIndexer:
             "size": k,
             "query": {"knn": {"embedding": {"vector": vector, "k": k}}},
         }
-        # query_body = {
-        #     "knn": {
-        #         "field": "embedding",  # The field where the vectors are stored
-        #         "query_vector": vector,  # The normalized query vector
-        #         "k": k,  # Number of nearest neighbors to return
-        #         "num_candidates": 200,  # Controls search depth (improves accuracy)
-        #     }
-        # }
 
         try:
             resp = self.client.search(index=self.index_name, body=query_body)
-            # resp = self.client.transport.perform_request(
-            #     method="POST", url=f"/{self.index_name}/_knn_search", body=query_body
-            # )
             hits = resp["hits"]["hits"]
             return [(h["_source"], float(h["_score"])) for h in hits]
         except Exception as e:
@@ -532,6 +578,10 @@ class RAGModel:
             self.os_indexer = OpenSearchIndexer(os_client, OPENSEARCH_INDEX_NAME)
 
     async def build_embeddings_from_scratch(self, pmc_dir: str):
+        """
+        Scans the local PMC text files, chunks them, and then uses
+        batch-based embedding to index in OpenSearch.
+        """
         if not self.os_indexer:
             print("[RAGModel] No OpenSearch client => cannot index.")
             return
@@ -540,7 +590,7 @@ class RAGModel:
             print("[RAGModel] OpenSearch has data, skipping re-embedding.")
             return
 
-        print("[RAGModel] Building embeddings from local text...")
+        print("[RAGModel] Building embeddings from local text files...")
         files = os.listdir(pmc_dir)
         docs = []
         for fname in files:
@@ -562,101 +612,100 @@ class RAGModel:
             print("[RAGModel] No local docs found.")
             return
 
-        print(f"[RAGModel] Embedding {len(docs)} text chunks with BioBERT...")
-        embed_list = []
-        for d in docs:
-            emb = embed_text_bert(d["text"])
-            embed_list.append(emb)
+        print(f"[RAGModel] Embedding {len(docs)} text chunks in batches...")
+        # Extract just the text from each doc
+        texts = [d["text"] for d in docs]
 
-        embed_array = np.array(embed_list, dtype=np.float32)
+        # Embed all texts in asynchronous batches
+        embed_array = await embed_texts_in_batches(texts, batch_size=BATCH_SIZE)
+
+        # Index into OpenSearch
         self.os_indexer.add_embeddings(embed_array, docs)
         print("[RAGModel] Finished indexing in OpenSearch.")
 
     def os_search(self, query_emb: np.ndarray, top_k: int = 5):
         if not self.os_indexer:
             return []
-
         return self.os_indexer.search(query_emb, k=top_k)
 
     async def ask(self, query: str, top_k: int = 5) -> str:
         if not query.strip():
             return "[ERROR] Empty query."
 
-        # 1) Embed locally with BioBERT
-        q_emb = embed_query_bert(query)
+        # Embed query
+        q_emb = embed_query_jina(query)
 
-        # 2) Redis LFU cache check
+        # Check Redis LFU cache
         cached = lfu_cache_get(q_emb)
         if cached:
             print("[RAGModel] Cache hit.")
             return cached
 
-        # 3) Intent classification => skip LLM if not needed
+        # Determine intent => set how many docs
         intent_label = combined_intent_classification(query)
         effective_top_k = CATEGORY_TOPK_MAP.get(intent_label, top_k)
 
-        # 4) Handle special cases
-        if intent_label == "find_most_recent":
-            recents = find_most_recent_papers(limit=effective_top_k)
-            if not recents:
-                return "No recent papers found."
+        # Special handling
+        # if intent_label == "find_most_recent":
+        #     recents = find_most_recent_papers(limit=effective_top_k)
+        #     if not recents:
+        #         return "No recent papers found."
 
-            context_text = ""
-            for r in recents:
-                context_text += (
-                    f"--- Paper ID: {r['id']} ---\n"
-                    f"Title: {r['title']}\n"
-                    f"{r['abstract']}\n\n"
-                )
+        #     context_text = ""
+        #     for r in recents:
+        #         context_text += (
+        #             f"--- Paper ID: {r['id']} ---\n"
+        #             f"Title: {r['title']}\n"
+        #             f"{r['abstract']}\n\n"
+        #         )
+        #     answer = await remote_summarize(context_text, query)
+        #     lfu_cache_put(q_emb, answer)
+        #     return answer
 
-            answer = await remote_summarize(context_text, query)
-            lfu_cache_put(q_emb, answer)
-            return answer
+        # elif intent_label == "find_highly_cited":
+        #     cits = find_highly_cited_papers(limit=effective_top_k)
+        #     if not cits:
+        #         return "No highly cited papers found."
 
-        elif intent_label == "find_highly_cited":
-            cits = find_highly_cited_papers(limit=effective_top_k)
-            if not cits:
-                return "No highly cited papers found."
+        #     context_text = ""
+        #     for c in cits:
+        #         context_text += (
+        #             f"--- Paper ID: {c['id']} ---\n"
+        #             f"Title: {c['title']}\n"
+        #             f"{c['abstract']}\n\n"
+        #         )
+        #     answer = await remote_summarize(context_text, query)
+        #     lfu_cache_put(q_emb, answer)
+        #     return answer
 
-            context_text = ""
-            for c in cits:
-                context_text += (
-                    f"--- Paper ID: {c['id']} ---\n"
-                    f"Title: {c['title']}\n"
-                    f"{c['abstract']}\n\n"
-                )
+        # if intent_label == "count_documents":
+        #     results = self.os_search(q_emb, effective_top_k)
+        #     doc_ids = set(r[0]["doc_id"] for r in results)
+        #     final = f"Found {len(doc_ids)} matching docs: {list(doc_ids)}"
+        #     lfu_cache_put(q_emb, final)
+        #     return final
 
-            answer = await remote_summarize(context_text, query)
-            lfu_cache_put(q_emb, answer)
-            return answer
-
-        elif intent_label == "count_documents":
-            results = self.os_search(q_emb, effective_top_k)
-            doc_ids = set(r[0]["doc_id"] for r in results)
-            final = f"Found {len(doc_ids)} matching docs: {list(doc_ids)}"
-            lfu_cache_put(q_emb, final)
-            return final
-
-        # 5) Otherwise => do KNN search in OpenSearch
+        # Otherwise => KNN in OpenSearch
         results = self.os_search(q_emb, effective_top_k)
         if not results:
             return "No documents found for your query."
 
-        # Build context from docs
         doc_map = {}
         for doc_source, score in results:
-            d_id = doc_source["doc_id"]
-            if d_id not in doc_map:
-                doc_map[d_id] = doc_source["text"]
+            doc_id = doc_source["doc_id"]
+            if doc_id not in doc_map:
+                doc_map[doc_id] = doc_source["text"]
             else:
-                doc_map[d_id] += "\n" + doc_source["text"]
+                doc_map[doc_id] += "\n" + doc_source["text"]
+
+        print(f"[OpenSearchIndexer] Found {len(doc_map)} docs in search.")
 
         context_text = ""
-        for doc_id, content in doc_map.items():
+        for doc_id, doc_content in doc_map.items():
             print(doc_id)
-            context_text += (
-                f"--- Document ID: {doc_id} ---\nDocument Content: {content}\n\n"
-            )
+            context_text += f"--- Document: {doc_id} ---\n{doc_content}\n\n"
+
+        # print(context_text)
 
         final_answer = await remote_answer(context_text, query)
         lfu_cache_put(q_emb, final_answer)
@@ -671,42 +720,54 @@ async def remote_summarize(context_text: str, user_query: str, max_tokens=200) -
         "Give a short summary or direct answer, referencing relevant Document IDs or Names if needed.\n"
     )
     return await call_remote_llm(
-        context_text=prompt_context, user_query="", max_tokens=max_tokens
+        context_text=prompt_context, user_query=user_query, max_tokens=max_tokens
     )
 
 
 async def remote_answer(context_text: str, user_query: str, max_tokens=200) -> str:
+    # prompt_context = (
+    #     "### User Instructions:\n"
+    #     "You are a helpful medical assistant. You have access to the following provided context "
+    #     "which may contain references to documents (e.g., PMC51123.txt, etc.). "
+    #     "Answer accurately using only this provided information or context. "
+    #     "Mention document IDs for any references in your final answer. "
+    #     "If there's insufficient info, just say so.\n\n"
+    #     f"### Relevant Information or Context (Documents):\n{context_text}\n\n"
+    # )
+
     prompt_context = (
-        "### Instructions:\n"
-        "You are a helpful medical assistant. You have access to the following provided context "
-        "which may contain references to documents (e.g., PMC51123.txt, PMC23124.txt, etc.). "
-        "Your job is to answer the user's question accurately using only this provided information or context and nothing else. "
-        "Mention the document IDs citing the specific term or discussing the subject (from which you extracted the user-query specific information) "
-        "in your answer in the format: Answer Text -> Document ID/Name (without the file extension like '.txt'). "
-        "Do not include the prompt or your chain-of-thought in your response! Only provide the final answer using the provided context and nothing more. "
-        "If there is not enough info, just say so!\n\n"
-        f"### Relevant Information or Context (Documents):\n{context_text}\n\n"
-        # "### Response:\n"
-        "Answer accurately only using this information that was retrieved from the database!"
+        "INSTRUCTIONS: You must cite the **Document ID or Name** for any information you use. "
+        "Your answer must follow this format: Direct Answer (at most 4 sentences)\nReferences (list any Document IDs from which the answer is extracted, e.g., Document XYZ). "
+        "Your answer must be specific to the user query regardless of the provided context information. "
+        "If the Document ID is 'PMC555957.txt', refer to it as 'Document PMC555957' (without the file extension). "
+        "If multiple documents are relevant, cite each of them explicitly. "
+        "Do NOT reveal your reasoning or chain of thought. "
+        "If insufficient information or if the provided context is not relevant to the user query, then say so clearly, but do not give a false response based on your own knowledge of these terms or questions.\n\n"
+        f"User Query:\n{user_query}\n\n"
+        "Context:\n"
+        f"{context_text}\n"
+        "--- End of context ---\n\n"
+        "Provide your answer strictly based on the above information and following all instructions carefully!"
     )
     return await call_remote_llm(
-        context_text=prompt_context, user_query=user_query, max_tokens=max_tokens
+        context_text=prompt_context, user_query="", max_tokens=max_tokens
     )
 
 
 # ==============================================================================
 # FastAPI Setup
 # ==============================================================================
-app = FastAPI(title="Local RAG + BioBERT + Local DB + Remote LLM)", version="6.0")
+app = FastAPI(
+    title="Local RAG + Jina Embeddings + Local DB + Remote LLM", version="3.0"
+)
 
-rag_model: Optional["RAGModel"] = None
+rag_model: Optional[RAGModel] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global rag_model
     rag_model = RAGModel()
-    # Possibly embed local docs if needed
     await rag_model.build_embeddings_from_scratch(PMC_DIR)
     yield
     print("[Shutdown] Done.")
@@ -719,7 +780,7 @@ async def search_opensearch_route(query: str = Body(...), top_k: int = 5):
     if not rm:
         return {"error": "No RAG model."}
 
-    q_emb = embed_query_bert(query)
+    q_emb = embed_query_jina(query)
     results = rm.os_search(q_emb, top_k)
     out = []
     for doc_source, score in results:

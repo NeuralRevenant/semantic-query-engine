@@ -3,6 +3,7 @@ import torch
 from fastapi import FastAPI
 from pydantic import BaseModel
 import uvicorn
+
 from transformers import (
     pipeline,
     AutoModelForCausalLM,
@@ -14,8 +15,11 @@ from transformers import (
 # 1. Model & Pipeline Setup
 ##################################################################
 
-MODEL_NAME = "ruslanmv/Medical-Llama3-8B"
+HF_TOKEN = ""
 
+MODEL_NAME = "meta-llama/Llama-2-13b-chat-hf"
+
+# 4-bit quantization config
 quant_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_compute_dtype=torch.float16,
@@ -23,23 +27,33 @@ quant_config = BitsAndBytesConfig(
     bnb_4bit_quant_type="nf4",
 )
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+# Transformers can authenticate to the gated repo using below
+tokenizer = AutoTokenizer.from_pretrained(
+    MODEL_NAME,
+    token=HF_TOKEN,
+)
+
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     device_map="auto",
     quantization_config=quant_config,
     torch_dtype=torch.float16,
+    token=HF_TOKEN,
 )
 
-# Using the default pipeline.
-pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
+# Create a pipeline
+pipe = pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+)
 
 ##################################################################
 # 2. FastAPI App
 ##################################################################
 app = FastAPI(
     title="GCP LLM Generation Service",
-    description="Optimized Medical LLM with concise output, referencing doc IDs as needed.",
+    description="Optimized Llama-2 13B for medical QA, referencing doc IDs.",
     version="1.0",
 )
 
@@ -50,7 +64,7 @@ app = FastAPI(
 class GenerationRequest(BaseModel):
     context: str
     query: str
-    max_new_tokens: int = 128
+    max_new_tokens: int = 256
     temperature: float = 0.7
     top_k: int = 50
     top_p: float = 0.9
@@ -68,64 +82,87 @@ def generate_text(req: GenerationRequest):
     """
     Receives a 'context' + 'query' and returns a short medical answer
     that cites relevant doc IDs without returning the entire prompt.
+    We do NOT reduce max_new_tokens, but we do truncate the context from the back if needed.
     """
-    prompt = build_prompt(req.context, req.query)
+    # 1) Build the full initial prompt
+    raw_prompt = build_prompt(req.context, req.query)
 
-    # Use autocast in half-precision for performance
+    # 2) Tokenize the entire prompt
+    tokenized = tokenizer(raw_prompt, return_tensors="pt")
+    prompt_length = tokenized.input_ids.shape[1]
+
+    # 3) Compute total requested length
+    total_requested = prompt_length + req.max_new_tokens
+    if total_requested > 4096:
+        # We need to make room for new tokens by truncating the back of the context
+        max_prompt_length = 4096 - req.max_new_tokens
+        if max_prompt_length < 1:
+            max_prompt_length = 1  # Ensure at least 1 token remains
+
+        # 4) Keep only the FIRST max_prompt_length tokens and remove the rest
+        trimmed_ids = tokenized.input_ids[0][:max_prompt_length]
+        # Convert back to string
+        trimmed_prompt_str = tokenizer.decode(trimmed_ids, skip_special_tokens=False)
+
+        print(
+            f"[Warning] Original prompt had {prompt_length} tokens, truncated to {max_prompt_length} to allow {req.max_new_tokens} new tokens."
+        )
+        final_prompt = trimmed_prompt_str
+        prompt_length = max_prompt_length  # update
+    else:
+        final_prompt = raw_prompt
+
+    # 5) Our final max_length ensures we do not exceed 4096 tokens in total
+    max_length = prompt_length + req.max_new_tokens
+
+    # Use autocast in half-precision if CUDA is available
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
         outputs = pipe(
-            prompt,
+            final_prompt,
             max_new_tokens=req.max_new_tokens,
             temperature=req.temperature,
             top_k=req.top_k,
             top_p=req.top_p,
             do_sample=True,
             num_return_sequences=1,
+            max_length=max_length,
+            pad_token_id=tokenizer.eos_token_id,  # Avoid pad token warnings
         )
 
     generated_text = outputs[0]["generated_text"]
-
     print(f"Generated Text: {generated_text}")
-    # Post-processing to remove the prompt or repeated text:
-    # We look for the "### Response:" delimiter below and extract just that portion.
-    answer = extract_model_answer(generated_text, prompt)
+
+    answer = extract_model_answer(generated_text, final_prompt)
     print(f"Answer Text: {answer}")
 
     return GenerationResponse(answer=answer.strip())
 
 
 ##################################################################
-# 5. Improved Prompt Construction
+# 5. Prompt Helpers
 ##################################################################
 def build_prompt(context: str, query: str) -> str:
     """
-    Build an instruction-style prompt that:
-    - Provides user context with doc IDs.
-    - Asks for a concise answer that references only relevant doc IDs.
-    - Prohibits returning the entire prompt or chain of thought.
+    Build an instruction-style prompt with context & query.
     """
     return (
-        f"### User Query (or Question): {query}\n\n"
-        f"### Relevant Information/Context along with the instructions below:\n{context}"
+        "You are a helpful AI assistant. Use the provided documents' context or information while following every instruction extremely carefully!\n\n"
+        f"### Context:\n{context}\n\n"
+        # f"### User Query:\n{query}\n\n"
+        "### Response:\n"
     )
 
 
 def extract_model_answer(generated_text: str, prompt: str) -> str:
     """
-    A utility to remove the entire prompt portion from the generated text,
-    returning only the model's final portion after '### Response:'.
+    Remove the prompt from the generated text and keep only the model's answer.
     """
-    # Split off everything before '### Response:' if it still appears.
-    # If the model doesn't strictly follow that might need more robust logic.
     split_marker = "### Response:"
     if split_marker in generated_text:
-        # Get only what comes after '### Response:'.
         return generated_text.split(split_marker, 1)[-1]
     else:
-        # Fallback: remove the initial prompt from the output if present
         if prompt in generated_text:
             return generated_text.replace(prompt, "")
-        
         return generated_text
 
 
@@ -133,9 +170,7 @@ def extract_model_answer(generated_text: str, prompt: str) -> str:
 # 6. Server Entry Point
 ##################################################################
 if __name__ == "__main__":
-    # Tweak CUDA memory allocation behavior if needed
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:true"
-
     uvicorn.run(
         "generation:app",
         host="0.0.0.0",
