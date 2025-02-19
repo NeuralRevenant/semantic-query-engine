@@ -113,10 +113,12 @@ def generate_text(req: GenerationRequest):
         final_prompt = raw_prompt
 
     # 5) Our final max_length ensures we do not exceed 4096 tokens in total
-    max_length = prompt_length + req.max_new_tokens
+    # max_length = prompt_length + req.max_new_tokens
 
     # Use autocast in half-precision if CUDA is available
-    with torch.no_grad(), torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+    with torch.inference_mode(), torch.amp.autocast(
+        "cuda", enabled=torch.cuda.is_available()
+    ):
         outputs = pipe(
             final_prompt,
             max_new_tokens=req.max_new_tokens,
@@ -125,9 +127,9 @@ def generate_text(req: GenerationRequest):
             top_p=req.top_p,
             do_sample=True,
             num_return_sequences=1,
-            max_length=max_length,
-            truncation=True,
-            pad_token_id=tokenizer.eos_token_id,  # Avoid pad token warnings
+            # max_length=max_length,
+            # truncation=True,
+            # pad_token_id=tokenizer.eos_token_id,  # Avoid pad token warnings
         )
 
     generated_text = outputs[0]["generated_text"]
@@ -147,8 +149,8 @@ def build_prompt(context: str, query: str) -> str:
     Build an instruction-style prompt with context & query.
     """
     return (
-        "You are a helpful AI assistant. Use the provided context or information following every instruction given extremely carefully.\n\n"
-        f"### Context:\n{context}\n\n"
+        "You are a helpful AI assistant. Use the provided context, following every instruction extremely carefully!\n\n"
+        f"{context}\n\n"
         # f"### User Query:\n{query}\n\n"
         "### Response:\n"
     )

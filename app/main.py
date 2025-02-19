@@ -44,12 +44,6 @@ import spacy
 import httpx
 
 
-torch.use_deterministic_algorithms(
-    True
-)  # Enforce deterministic CPU/GPU ops where possible
-torch.backends.cudnn.benchmark = False  # Disable auto-benchmark
-# Dropout is disabled in eval mode, so setting model.eval() is crucial.
-
 # ==============================================================================
 # Configuration Constants
 # ==============================================================================
@@ -67,7 +61,7 @@ CHUNK_SIZE = 512
 # ---- Batching & Concurrency ----
 BATCH_SIZE = 64  # For embedding documents in batches
 MAX_EMBED_CONCURRENCY = (
-    5  # Limit the number of concurrent embedding tasks to avoid GPU overload
+    10  # Limit the number of concurrent embedding tasks to avoid GPU overload
 )
 
 
@@ -134,7 +128,6 @@ def lfu_cache_get(query_emb: np.ndarray) -> Optional[str]:
     for i, item in enumerate(cached_list):
         entry = json.loads(item)
         emb_list = entry["embedding"]
-        freq = entry.get("freq", 1)
 
         cached_emb = np.array(emb_list, dtype=np.float32)
         sim = cosine_similarity(query_vec, cached_emb)
@@ -296,8 +289,16 @@ embedding_tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_NAME)
 embedding_model = AutoModel.from_pretrained(
     EMBED_MODEL_NAME,
     torch_dtype=inference_dtype,
+    attn_implementation="eager",  # Ensure SDPA is not bypassed
 ).to(device)
-embedding_model.eval()  # IMP: disable dropout & ensures dropout is disabled, so the model doesn't randomly drop neurons
+
+embedding_model.eval()  # Disable dropout for deterministic inference, and so that model doesn't randomly drop neurons
+
+# # Compile model for faster inference (with PyTorch 2.0+ versions) - error with transformers library!
+# if torch.__version__ >= "2.0":
+#     embedding_model = torch.compile(
+#         embedding_model, mode="reduce-overhead"
+#     )  # Best for inference
 
 
 def _attention_mask_mean_pool(
@@ -322,23 +323,24 @@ def embed_single_text(text: str) -> np.ndarray:
     if not text.strip():
         return np.zeros((EMBED_DIM,), dtype=np.float32)
 
+    # Enable async tensor transfers using non-blocking=true option
     inputs = embedding_tokenizer(
         text, return_tensors="pt", truncation=True, max_length=512
-    ).to(device)
+    ).to(device, non_blocking=True)
 
     # Use autocast if we are on CUDA NVIDIA GPU for half-precision, otherwise not supported
     if device.type == "cuda":
         with autocast(device_type=device.type, enabled=True):
-            outputs = embedding_model(**inputs)
+            outputs = embedding_model(**inputs, output_attentions=False, head_mask=None)
     else:
-        outputs = embedding_model(**inputs)
+        outputs = embedding_model(**inputs, output_attentions=False, head_mask=None)
 
     hidden_states = outputs.last_hidden_state  # [1, seq_len, 768]
     pooled = _attention_mask_mean_pool(hidden_states, inputs["attention_mask"])
 
     # Convert to float32 before NumPy conversion to avoid NaNs
-    emb_np = pooled[0].detach().cpu().to(torch.float32).numpy()
-    # emb_np = pooled[0].detach().cpu().numpy().astype(np.float32)
+    # emb_np = pooled[0].detach().cpu().to(torch.float32).numpy()
+    emb_np = pooled[0].detach().cpu().numpy().astype(np.float32)
     return emb_np
 
 
@@ -382,14 +384,18 @@ async def embed_texts_in_batches(texts: List[str], batch_size: int = 32) -> np.n
                 padding=True,
                 truncation=True,
                 max_length=512,
-            ).to(device)
+            ).to(device, non_blocking=True)
 
             with torch.inference_mode():
                 if device.type == "cuda":
                     with autocast(device_type=device.type, enabled=True):
-                        outputs = embedding_model(**inputs)
+                        outputs = embedding_model(
+                            **inputs, output_attentions=False, head_mask=None
+                        )
                 else:
-                    outputs = embedding_model(**inputs)
+                    outputs = embedding_model(
+                        **inputs, output_attentions=False, head_mask=None
+                    )
 
             hidden_states = (
                 outputs.last_hidden_state
@@ -398,8 +404,8 @@ async def embed_texts_in_batches(texts: List[str], batch_size: int = 32) -> np.n
             pooled = _attention_mask_mean_pool(hidden_states, inputs["attention_mask"])
 
             # Convert to float32 before NumPy conversion to avoid NaNs
-            # return pooled.detach().cpu().numpy().astype(np.float32)
-            return pooled.detach().cpu().to(torch.float32).numpy()
+            return pooled.detach().cpu().numpy().astype(np.float32)
+            # return pooled.detach().cpu().to(torch.float32).numpy()
 
     # Schedule embedding tasks for each batch
     tasks = [embed_one_batch(batch) for batch in batches]
@@ -736,16 +742,17 @@ async def remote_answer(context_text: str, user_query: str, max_tokens=200) -> s
     # )
 
     prompt_context = (
-        "INSTRUCTIONS: You must cite the Document ID or Name for any information you use. "
+        "Provide your answer strictly based on the provided context or information, following every instruction below extremely carefully:\n"
+        "You must cite the Document ID or Name for any information you use. "
         "Your answer must follow this format: Direct Answer (at most 4 sentences). References (list any Document IDs from which the answer is extracted, e.g., Document XYZ). "
         "Your answer must be specific to the user query regardless of the provided context information. "
-        "If insufficient information or if the provided context is not relevant to the user query, then clearly say so instead of giving a false response based on your own knowledge. "
+        "If insufficient information or if the provided context is not relevant to the user query, then clearly say so instead of giving a false response based on your own knowledge of these terms or the question. "
         "If the Document ID is 'PMC555957.txt', refer to it as 'Document PMC555957' (without the file extension). "
         "If multiple documents are relevant, cite each of them explicitly. "
-        "Do NOT reveal your reasoning or chain of thought. "
-        "Provide your answer strictly based on the information given below, following every instruction mentioned till now very carefully:\n\n"
-        f"User Query:\n{user_query}\n"
-        f"Provided Context or Information:\n{context_text}\n"
+        "Do NOT reveal your reasoning or chain of thought.\n"
+        "--- End of Instructions ---\n\n"
+        f"User Query: {user_query}\n"
+        f"Context or Information:\n{context_text}\n"
     )
     return await call_remote_llm(
         context_text=prompt_context, user_query="", max_tokens=max_tokens
@@ -766,6 +773,7 @@ rag_model: Optional[RAGModel] = None
 async def lifespan(app: FastAPI):
     global rag_model
     rag_model = RAGModel()
+    print(f"Model's Attention Config: {embedding_model.config.position_embedding_type}")
     await rag_model.build_embeddings_from_scratch(PMC_DIR)
     yield
     print("[Shutdown] Done.")
