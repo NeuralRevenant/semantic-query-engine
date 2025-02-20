@@ -61,7 +61,7 @@ CHUNK_SIZE = 512
 # ---- Batching & Concurrency ----
 BATCH_SIZE = 64  # For embedding documents in batches
 MAX_EMBED_CONCURRENCY = (
-    10  # Limit the number of concurrent embedding tasks to avoid GPU overload
+    5  # Limit the number of concurrent embedding tasks to avoid GPU overload
 )
 
 
@@ -83,7 +83,7 @@ print(f"inference data type: {inference_dtype}")
 EMBED_MODEL_NAME = "jinaai/jina-embeddings-v2-base-de"
 
 # Remote LLM endpoint
-REMOTE_LLM_URL = os.getenv("REMOTE_LLM_URL", "")
+REMOTE_LLM_URL = os.getenv("REMOTE_LLM_URL", ".../generate")
 
 # PostgreSQL
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
@@ -95,7 +95,7 @@ POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
 # OpenSearch
 OPENSEARCH_HOST = os.environ.get("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT = int(os.environ.get("OPENSEARCH_PORT", 9200))
-OPENSEARCH_INDEX_NAME = ""
+OPENSEARCH_INDEX_NAME = "medical-search-index"
 
 # Local text files
 PMC_DIR = ""
@@ -305,9 +305,8 @@ def _attention_mask_mean_pool(
     hidden_states: torch.Tensor, attention_mask: torch.Tensor
 ) -> torch.Tensor:
     """
-    Typical attention-mask mean pooling:
-      sum(token_embeddings * mask) / sum(mask)
-    This often matches how 'sentence-transformers' style models do mean pooling.
+    Typical attention-mask mean pooling: sum(token_embeddings * mask) / sum(mask)
+    similar to how 'sentence-transformers' style models do mean pooling.
     """
     input_mask_expanded = (
         attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
@@ -326,11 +325,11 @@ def embed_single_text(text: str) -> np.ndarray:
     # Enable async tensor transfers using non-blocking=true option
     inputs = embedding_tokenizer(
         text, return_tensors="pt", truncation=True, max_length=512
-    ).to(device, non_blocking=True)
+    ).to(device)
 
     # Use autocast if we are on CUDA NVIDIA GPU for half-precision, otherwise not supported
     if device.type == "cuda":
-        with autocast(device_type=device.type, enabled=True):
+        with autocast(device_type="cuda", enabled=True):
             outputs = embedding_model(**inputs, output_attentions=False, head_mask=None)
     else:
         outputs = embedding_model(**inputs, output_attentions=False, head_mask=None)
@@ -339,8 +338,8 @@ def embed_single_text(text: str) -> np.ndarray:
     pooled = _attention_mask_mean_pool(hidden_states, inputs["attention_mask"])
 
     # Convert to float32 before NumPy conversion to avoid NaNs
-    # emb_np = pooled[0].detach().cpu().to(torch.float32).numpy()
-    emb_np = pooled[0].detach().cpu().numpy().astype(np.float32)
+    emb_np = pooled[0].detach().cpu().to(torch.float32).numpy()
+    # emb_np = pooled[0].detach().cpu().numpy().astype(np.float32)
     return emb_np
 
 
@@ -384,11 +383,11 @@ async def embed_texts_in_batches(texts: List[str], batch_size: int = 32) -> np.n
                 padding=True,
                 truncation=True,
                 max_length=512,
-            ).to(device, non_blocking=True)
+            ).to(device)
 
             with torch.inference_mode():
                 if device.type == "cuda":
-                    with autocast(device_type=device.type, enabled=True):
+                    with autocast(device_type="cuda", enabled=True):
                         outputs = embedding_model(
                             **inputs, output_attentions=False, head_mask=None
                         )
@@ -401,11 +400,12 @@ async def embed_texts_in_batches(texts: List[str], batch_size: int = 32) -> np.n
                 outputs.last_hidden_state
             )  # shape: [batch_size, seq_len, 768]
             # Weighted mean pooling using attention mask
+            # print(f"Outputs: {outputs}")
             pooled = _attention_mask_mean_pool(hidden_states, inputs["attention_mask"])
-
+            # print(f"return value from embed_one_batch: {pooled}")
             # Convert to float32 before NumPy conversion to avoid NaNs
-            return pooled.detach().cpu().numpy().astype(np.float32)
-            # return pooled.detach().cpu().to(torch.float32).numpy()
+            # return pooled.detach().cpu().numpy().astype(np.float32)
+            return pooled.detach().cpu().to(torch.float32).numpy()
 
     # Schedule embedding tasks for each batch
     tasks = [embed_one_batch(batch) for batch in batches]
@@ -539,14 +539,30 @@ class OpenSearchIndexer:
         self, query_emb: np.ndarray, k: int = 5
     ) -> List[Tuple[Dict[str, Any], float]]:
         if not self.client or query_emb.size == 0:
+            print("[Error] Query embedding is empty!")
             return []
+
+        if query_emb.shape[1] != EMBED_DIM:  # Ensure correct dimensionality
+            print(
+                f"[Error] Embedding shape mismatch! Expected ({EMBED_DIM},) but got {query_emb.shape}"
+            )
+            return []
+
         q_norm = np.linalg.norm(query_emb, axis=1, keepdims=True)
         query_emb = query_emb / (q_norm + 1e-9)
         vector = query_emb[0].tolist()
-
+        # print(f"vector: {vector}")
         query_body = {
             "size": k,
-            "query": {"knn": {"embedding": {"vector": vector, "k": k}}},
+            "query": {
+                "knn": {
+                    # "embedding": {"vector": vector, "k": k}
+                    "field": "embedding",
+                    "query_vector": vector,
+                    "k": k,
+                    "num_candidates": 100,
+                }
+            },
         }
 
         try:
@@ -632,14 +648,17 @@ class RAGModel:
     def os_search(self, query_emb: np.ndarray, top_k: int = 5):
         if not self.os_indexer:
             return []
+
         return self.os_indexer.search(query_emb, k=top_k)
 
     async def ask(self, query: str, top_k: int = 5) -> str:
-        if not query.strip():
+        if not query or not query.strip():
             return "[ERROR] Empty query."
 
+        # print(f"Query: {query}")
         # Embed query
         q_emb = embed_query_jina(query)
+        # print(f"Query-Embeddings: {q_emb}")
 
         # Check Redis LFU cache
         cached = lfu_cache_get(q_emb)
