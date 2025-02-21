@@ -3,3 +3,13 @@ __pycache__/
 .venv/
 relevant_SS
 rag_env
+RAG.drawio
+RAG.drawio.png
+datasets/
+distilbert_checkpoints/
+distilbert_intent.onnx
+distilbert_intent_final/
+model_nlu/
+training_checkpoint.json
+old_trained_pipelines/
+medical_query_classification_dataset.json
