@@ -1,48 +1,42 @@
 import os
 import json
 import numpy as np
-from typing import List, Tuple, Optional, Dict, Any
-
-from fastapi import FastAPI, Body
-import uvicorn
-import redis
-
-from opensearchpy import OpenSearch, RequestsHttpConnection
-from opensearchpy.helpers import bulk
+from typing import List, Tuple, Optional, Dict
 
 import asyncio
 from contextlib import asynccontextmanager
 
-import httpx  # for Ollama's embedding calls
-import openai  # for GPT-4o generation
+import httpx
+import uvicorn
+import redis
+
+from fastapi import FastAPI, Body
+from opensearchpy import OpenSearch, RequestsHttpConnection
+from opensearchpy.helpers import bulk
 
 # ==============================================================================
-# Configuration Constants
+# Global Constants & Configuration
 # ==============================================================================
-
-# Ollama specifics for embeddings
 OLLAMA_API_URL = "http://localhost:11434/api"
-EMBED_MODEL_NAME = "jina/jina-embeddings-v2-base-de"  # local Ollama embedding model
 
-# OpenAI specifics for generation
-OPENAI_API_KEY = os.getenv(
-    "OPENAI_API_KEY",
-    "",
-)
-openai.api_key = OPENAI_API_KEY
-OPENAI_CHAT_MODEL = "gpt-4o"
+EMBED_MODEL_NAME = "jina/jina-embeddings-v2-base-de:latest"
 
-BATCH_SIZE = 128
+MAX_BLUEHIVE_CONCURRENCY = 5
+MAX_EMBED_CONCURRENCY = 5
+
+BLUEHIVE_BEARER_TOKEN = os.getenv("BLUEHIVE_BEARER_TOKEN", "")
+
+BATCH_SIZE = 64
 CHUNK_SIZE = 512
 EMBED_DIM = 768
-MAX_EMBED_CONCURRENCY = 5  # Concurrency limit to avoid overwhelming Ollama
 
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
-MAX_QUERY_CACHE = 1000
-CACHE_SIM_THRESHOLD = 0.96  # Cosine similarity threshold for cache lookup
+REDIS_MAX_ITEMS = 1000
+REDIS_CACHE_LIST = "query_cache_lfu"
+CACHE_SIM_THRESHOLD = 0.96
 
-PMC_DIR = "./PMC"
+PMC_DIR = "../PMC"
 
 # ==============================================================================
 # Redis Client & Cache Functions
@@ -50,54 +44,84 @@ PMC_DIR = "./PMC"
 redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
 
 
-def store_query_in_redis(query_emb: np.ndarray, response: str):
-    """Store a query embedding and its response in Redis."""
-    emb_list = query_emb.tolist()[0]
-    entry = {"embedding": emb_list, "response": response}
-    redis_client.lpush("query_cache", json.dumps(entry))
-    redis_client.ltrim("query_cache", 0, MAX_QUERY_CACHE - 1)
-
-
-def find_similar_query_in_redis(query_emb: np.ndarray) -> Optional[str]:
-    """Search Redis for an embedding similar enough to query_emb and return the cached response if found."""
-    cached_list = redis_client.lrange("query_cache", 0, MAX_QUERY_CACHE - 1)
-    query_vec = query_emb[0]
-
-    best_sim = -1.0
-    best_response = None
-
-    for c in cached_list:
-        entry = json.loads(c)
-        emb_list = entry["embedding"]
-        cached_emb = np.array(emb_list, dtype=np.float32)
-        sim = cosine_similarity(query_vec, cached_emb)
-        if sim > best_sim:
-            best_sim = sim
-            best_response = entry["response"]
-
-    if best_sim >= CACHE_SIM_THRESHOLD:
-        return best_response
-
-    return None
-
-
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Compute cosine similarity between two 1-D arrays."""
     norm_a = np.linalg.norm(a)
     norm_b = np.linalg.norm(b)
     if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
-
     return float(np.dot(a, b) / (norm_a * norm_b))
 
 
+def lfu_cache_get(query_emb: np.ndarray) -> Optional[str]:
+    """Retrieve a cached answer if we find a sufficiently similar embedding."""
+    cached_list = redis_client.lrange(REDIS_CACHE_LIST, 0, -1)
+    if not cached_list:
+        return None
+
+    query_vec = query_emb[0]
+    best_sim = -1.0
+    best_index = -1
+    best_entry_data = None
+
+    for i, item in enumerate(cached_list):
+        entry = json.loads(item)
+        emb_list = entry["embedding"]
+
+        cached_emb = np.array(emb_list, dtype=np.float32)
+        sim = cosine_similarity(query_vec, cached_emb)
+        if sim > best_sim:
+            best_sim = sim
+            best_index = i
+            best_entry_data = entry
+
+    if best_sim < CACHE_SIM_THRESHOLD:
+        return None
+
+    if best_entry_data:
+        # increment freq
+        best_entry_data["freq"] = best_entry_data.get("freq", 1) + 1
+        redis_client.lset(REDIS_CACHE_LIST, best_index, json.dumps(best_entry_data))
+        return best_entry_data["response"]
+
+    return None
+
+
+def _remove_least_frequent_item():
+    """Helper to remove the least frequently used entry from Redis."""
+    cached_list = redis_client.lrange(REDIS_CACHE_LIST, 0, -1)
+    if not cached_list:
+        return
+
+    min_freq = float("inf")
+    min_index = -1
+    for i, item in enumerate(cached_list):
+        entry = json.loads(item)
+        freq = entry.get("freq", 1)
+        if freq < min_freq:
+            min_freq = freq
+            min_index = i
+
+    if min_index >= 0:
+        item_str = cached_list[min_index]
+        redis_client.lrem(REDIS_CACHE_LIST, 1, item_str)
+
+
+def lfu_cache_put(query_emb: np.ndarray, response: str):
+    """Insert a new entry into the LFU Redis cache."""
+    entry = {"embedding": query_emb.tolist()[0], "response": response, "freq": 1}
+    current_len = redis_client.llen(REDIS_CACHE_LIST)
+    if current_len >= REDIS_MAX_ITEMS:
+        _remove_least_frequent_item()
+
+    redis_client.lpush(REDIS_CACHE_LIST, json.dumps(entry))
+
+
 # ==============================================================================
-# Asynchronous Ollama API Functions
+# Asynchronous Functions for Ollama Embeddings
 # ==============================================================================
 async def ollama_embed_text(text: str, model: str = EMBED_MODEL_NAME) -> List[float]:
     """
-    Request an embedding for `text` from Ollama via HTTP POST.
-    Expects JSON of form {"model": model, "prompt": text} and returns {"embedding": [...]}
+    Request an embedding for `text` from Ollama via HTTP POST (using the Jina model).
     """
     async with httpx.AsyncClient() as client:
         payload = {"model": model, "prompt": text, "stream": False}
@@ -106,11 +130,10 @@ async def ollama_embed_text(text: str, model: str = EMBED_MODEL_NAME) -> List[fl
         )
         resp.raise_for_status()
         data = resp.json()
-        # print(f"Embedding generated = {data.get('embedding', 'No embedding field')}")
         return data.get("embedding", [])
 
 
-async def embed_texts_in_batches(texts: List[str], batch_size: int = 32) -> np.ndarray:
+async def embed_texts_in_batches(texts: List[str], batch_size: int = 64) -> np.ndarray:
     """
     Embeds a list of texts in smaller batches, respecting concurrency limits.
     """
@@ -120,7 +143,6 @@ async def embed_texts_in_batches(texts: List[str], batch_size: int = 32) -> np.n
     all_embeddings = []
     concurrency_sem = asyncio.Semaphore(MAX_EMBED_CONCURRENCY)
 
-    # Process texts in batches
     for i in range(0, len(texts), batch_size):
         batch = texts[i : i + batch_size]
 
@@ -136,7 +158,9 @@ async def embed_texts_in_batches(texts: List[str], batch_size: int = 32) -> np.n
 
 
 async def embed_query(query: str) -> np.ndarray:
-    """Obtain an embedding for a single query from Ollama (local)."""
+    """
+    Obtain an embedding for a single query from Ollama (Jina embedding).
+    """
     if not query.strip():
         return np.array([])
 
@@ -145,49 +169,63 @@ async def embed_query(query: str) -> np.ndarray:
 
 
 # ==============================================================================
-# OpenAI for Remote Generation
+# BlueHive Completion Generation
 # ==============================================================================
-async def openai_generate_text(
-    prompt: str,
-    model: str = OPENAI_CHAT_MODEL,
-    temperature: float = 0.6,
-    max_tokens: int = 256,
-) -> str:
-    """
-    Request text generation from the new openai.chat.completions interface.
-    Returns the generated text content.
-    """
-    loop = asyncio.get_running_loop()
+BLUEHIVE_SEMAPHORE = asyncio.Semaphore(MAX_BLUEHIVE_CONCURRENCY)
 
-    def _run_openai():
-        response = openai.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a helpful assistant. Follow the user's instructions exactly.\n"
-                        "If you reference a document, use the phrase 'Document <ID>' without file extensions.\n"
-                        "Do not reveal your chain of thought."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
+
+async def bluehive_generate_text(prompt: str, system_msg: str = "") -> str:
+    """
+    Asynchronously call BlueHive's /api/v1/completion endpoint.
+    Passing a systemMessage plus the user prompt, and parse out the assistant's content.
+    """
+    headers = {
+        "Authorization": f"Bearer {BLUEHIVE_BEARER_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    url = "https://ai.bluehive.com/api/v1/completion"
+
+    payload = {
+        "prompt": prompt,
+        "systemMessage": system_msg,
+    }
+
+    try:
+        async with BLUEHIVE_SEMAPHORE:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    url, json=payload, headers=headers, timeout=30.0
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+        # expecting data["choices"][0]["message"]["content"]
+        choices = data.get("choices", [])
+        if not choices:
+            return "[ERROR] No choices in BlueHive response."
+
+        first_choice = choices[0]
+        message = first_choice.get("message", {})
+        content = message.get("content", "")
+        return content.strip()
+    except httpx.HTTPStatusError as e:
+        # handling the HTTP errors gracefully
+        print(f"[ERROR] HTTPStatusError: {str(e)}")
+        print(f"[DEBUG] Response Status Code: {e.response.status_code}")
+        print(f"[DEBUG] Response Text: {e.response.text}")
+        # a user-friendly message returned
+        return (
+            "[ERROR] An unexpected error occurred.\n"
+            f"Status Code: {e.response.status_code}\n"
         )
-        # Extract and return the content of the first completion
-        return response.choices[0].message.content.strip()
-
-    # Offload the synchronous call to a thread pool to avoid blocking
-    return await loop.run_in_executor(None, _run_openai)
-
-
-async def call_llm(prompt: str) -> str:
-    """
-    A wrapper function for the answer generation step using OpenAI.
-    """
-    return await openai_generate_text(prompt)
+    except httpx.RequestError as e:
+        # handle request level errors like any connection issues
+        print(f"[ERROR] RequestError: {str(e)}")
+        return "[ERROR] Failed connecting to the server. Please try again later."
+    except Exception as e:
+        # unexpected exceptions
+        print(f"[ERROR] Unexpected Exception: {str(e)}")
+        return "[ERROR] An unexpected error occurred. Please try again."
 
 
 # ==============================================================================
@@ -223,7 +261,7 @@ try:
                             "name": "hnsw",
                             "engine": "nmslib",
                             "space_type": "cosinesimil",
-                            "parameters": {"m": 16, "ef_construction": 200},
+                            "parameters": {"m": 48, "ef_construction": 400},
                         },
                     },
                 }
@@ -262,7 +300,6 @@ class OpenSearchIndexer:
             return
 
         actions = []
-        # Normalize each embedding vector for cosine similarity
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         embeddings = embeddings / (norms + 1e-9)
 
@@ -284,6 +321,7 @@ class OpenSearchIndexer:
             if len(actions) >= BATCH_SIZE:
                 self._bulk_index(actions)
                 actions = []
+
         if actions:
             self._bulk_index(actions)
 
@@ -295,7 +333,7 @@ class OpenSearchIndexer:
             print(f"[OpenSearchIndexer] Bulk indexing error: {e}")
 
     def search(
-        self, query_emb: np.ndarray, k: int = 5
+        self, query_emb: np.ndarray, k: int = 3
     ) -> List[Tuple[Dict[str, str], float]]:
         if not self.client or query_emb.size == 0:
             return []
@@ -316,9 +354,7 @@ class OpenSearchIndexer:
                 doc_source = h["_source"]
                 results.append((doc_source, float(doc_score)))
 
-            print(
-                f"[OpenSearchIndexer] Found {len(results)} relevant results in search."
-            )
+            print(f"[OpenSearchIndexer] Found {len(results)} relevant results.")
             return results
         except Exception as e:
             print(f"[OpenSearchIndexer] Search error: {e}")
@@ -334,13 +370,14 @@ def basic_cleaning(text: str) -> str:
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
     """
-    Splits text into chunks by word count.
+    Splits text into chunks of roughly chunk_size words.
     """
     words = text.split()
     chunks = []
     for i in range(0, len(words), chunk_size):
         chunk = " ".join(words[i : i + chunk_size])
         chunks.append(chunk.strip())
+
     return chunks
 
 
@@ -348,6 +385,14 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
 # RAG Model
 # ==============================================================================
 class RAGModel:
+    """
+    Retrieval-Augmented Generation Model with:
+    - OpenSearch for ANN-based retrieval
+    - Redis for caching
+    - Ollama for embeddings
+    - BlueHive for text generation
+    """
+
     def __init__(self):
         self.os_indexer: Optional[OpenSearchIndexer] = None
         if os_client:
@@ -355,8 +400,8 @@ class RAGModel:
 
     async def build_embeddings_from_scratch(self, pmc_dir: str):
         """
-        Reads text files from the given directory, splits them into chunks, obtains embeddings via Ollama,
-        and indexes them in OpenSearch.
+        Reads text files from the given directory, splits them into chunks,
+        obtains embeddings, and indexes them in OpenSearch.
         """
         if not self.os_indexer:
             print("[RAGModel] No OpenSearchIndexer => cannot build embeddings.")
@@ -392,99 +437,80 @@ class RAGModel:
         print(f"[RAGModel] Generating embeddings for {len(all_docs)} chunks...")
         chunk_texts = [d["text"] for d in all_docs]
 
-        # Use batch-based embedding approach with concurrency control
-        embs = await embed_texts_in_batches(chunk_texts, batch_size=32)
+        embs = await embed_texts_in_batches(chunk_texts, batch_size=64)
 
         loop = asyncio.get_running_loop()
-        # Offload synchronous OpenSearch indexing to a thread pool
         await loop.run_in_executor(None, self.os_indexer.add_embeddings, embs, all_docs)
         print("[RAGModel] Finished embedding & indexing data in OpenSearch.")
 
-    def os_search(self, query_emb: np.ndarray, top_k=5):
+    def os_search(self, query_emb: np.ndarray, top_k: int = 3):
+        """
+        Synchronous call to OpenSearch indexer for approximate k-NN retrieval.
+        """
         if not self.os_indexer:
             return []
 
         return self.os_indexer.search(query_emb, k=top_k)
 
-    async def ask(self, query: str, top_k: int = 5) -> str:
+    async def ask(self, query: str, top_k: int = 3) -> str:
         """
-        Process a user query:
-          1. Get its embedding via Ollama.
-          2. Check Redis cache for a similar query.
-          3. If not cached, perform a k-NN search in OpenSearch.
-          4. Generate an answer via the LLM.
-          5. Cache and return the answer.
+        Pipeline for a user query:
+          1) Check if query is empty.
+          2) Embed query, check Redis for a similar query.
+          3) If not cached, retrieve top_k results from OpenSearch.
+          4) Call BlueHive with final combined context.
+          5) Cache new result to Redis.
+          6) Return answer.
         """
         if not query.strip():
             return "[ERROR] Empty query."
 
-        # 1) Embed query
+        # Check cache
         query_emb = await embed_query(query)
-
-        # 2) Check Redis cache
-        cached_resp = find_similar_query_in_redis(query_emb)
+        cached_resp = lfu_cache_get(query_emb)
         if cached_resp is not None:
-            print(
-                "[RAGModel] Found a similar query in Redis cache. Returning cached result."
-            )
+            print("[RAGModel] Found a similar query in Redis. Returning cached result.")
             return cached_resp
 
-        # 3) Search OpenSearch
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(None, self.os_search, query_emb, top_k)
-
-        # 4) Prepare context & call LLM
-        doc_map = {}
-        for doc_dict, score in results:
+        # OpenSearch Retrieval
+        partial_results = self.os_search(query_emb, top_k)
+        context_map = {}
+        for doc_dict, _score in partial_results:
             doc_id = doc_dict["doc_id"]
             text_chunk = doc_dict["text"]
-            if doc_id not in doc_map:
-                doc_map[doc_id] = text_chunk
+            if doc_id not in context_map:
+                context_map[doc_id] = text_chunk
             else:
-                doc_map[doc_id] += "\n" + text_chunk
+                context_map[doc_id] += "\n" + text_chunk
 
-        print(f"[OpenSearchIndexer] Found {len(doc_map)} docs in search.")
-
+        # Build a short context
         context_text = ""
-        for doc_id, doc_content in doc_map.items():
+        for doc_id, doc_content in context_map.items():
             print(doc_id)
-            context_text += f"--- Document: {doc_id} ---\n{doc_content}\n\n"
+            context_text += f"--- Document ID: {doc_id} ---\n{doc_content}\n\n"
 
-        # print(context_text)
-
+        # Construct system and user prompts
+        system_msg = (
+            "You are a helpful AI assistant chatbot. You must follow these rules:\n"
+            "1) Always cite document IDs from the context exactly as 'Document XYZ'.\n"
+            "2) Answer in at most 4 sentences.\n"
+            "3) If you lack context, say so.\n"
+            "4) Do not add chain-of-thought.\n"
+        )
         final_prompt = (
-            "INSTRUCTIONS: You must cite the **Document ID or Name** for any information you use. "
-            "Your answer must follow this format: Direct Answer (at most 4 sentences)\nReferences (list any Document IDs from which the answer is extracted, e.g., Document XYZ). "
-            "Your answer must be specific to the user query regardless of the provided context information. "
-            "If the Document ID is 'PMC555957.txt', refer to it as 'Document PMC555957' (without the file extension). "
-            "If multiple documents are relevant, cite each of them explicitly. "
-            "Do NOT reveal your reasoning or chain of thought.\n\n"
             f"User Query:\n{query}\n\n"
-            "Context:\n"
-            f"{context_text}\n"
+            f"Context:\n{context_text}\n"
             "--- End of context ---\n\n"
-            "Provide your answer strictly based on the above information. If insufficient or not relevant, then say so."
+            "Provide your concise answer now."
         )
 
-        # final_prompt = (
-        #     f"User query which you got to answer:\n{query}\n\n"
-        #     f"Base your answer on the relevant information or context provided in the following documents:\n"
-        #     f"{context_text}\n"
-        #     "--- End of context ---\n\n"
-        #     "Follow the below instructions very carefully and provide the answer:\n"
-        #     "Keep the answer specific to the user query and do not return irrelevant information which is not relevant to the user query. "
-        #     "You must cite the specific Document ID exactly as in the context provided. "
-        #     "For example, if the Document ID is 'PMC555957.txt', refer to it as 'Document PMC555957' in your answer (without the file extension). "
-        #     "If multiple documents are relevant, cite them explicitly. "
-        #     "Please provide the best possible answer using ONLY the user query given above and the provided context information also given above. "
-        #     "Do not mention your chain of thought. "
-        #     "If the info is insufficient, say so."
-        # )
+        answer = await bluehive_generate_text(
+            prompt=final_prompt, system_msg=system_msg
+        )
+        if not answer:
+            return "Error: No response was generated. Please try later!"
 
-        answer = await call_llm(final_prompt)
-
-        # 5) Cache in Redis
-        store_query_in_redis(query_emb, answer)
+        lfu_cache_put(query_emb, answer)
         return answer
 
 
@@ -492,9 +518,15 @@ class RAGModel:
 # FastAPI Application Setup
 # ==============================================================================
 app = FastAPI(
-    title="RAG with LLMs + OpenSearch + Redis",
-    version="3.1",
-    description="RAG pipeline to answer queries using Ollama's embedding, OpenAI LLM, OpenSearch ANN, & Redis cache.",
+    title="RAG with BlueHive + Jina Embeddings + OpenSearch + Redis",
+    version="1.0.0",
+    description=(
+        "A simple RAG pipeline using:\n"
+        "- BlueHive AI for text generation\n"
+        "- Ollama's Jina embeddings for document/query embeddings\n"
+        "- OpenSearch for ANN retrieval\n"
+        "- Redis for caching\n"
+    ),
 )
 
 
@@ -503,6 +535,7 @@ async def lifespan(app: FastAPI):
     print("[Lifespan] Initializing RAGModel...")
     global rag_model
     rag_model = RAGModel()
+
     await rag_model.build_embeddings_from_scratch(PMC_DIR)
     print("[Lifespan] RAGModel is ready.")
     yield
@@ -517,18 +550,16 @@ def get_rag_model() -> RAGModel:
 
 
 @app.post("/search/opensearch")
-async def search_opensearch_route(query: str = Body(...), top_k: int = 5):
+async def search_opensearch_route(query: str = Body(...), top_k: int = 3):
     """
     API endpoint for performing approximate k-NN search via OpenSearch.
+    (Embeds the query with JinaAI, then searches in OpenSearch.)
     """
     rm = get_rag_model()
     if not rm:
         return {"error": "RAGModel not initialized."}
 
-    # Embed query text
     q_emb = await embed_query(query)
-
-    # Offload synchronous OS search to a thread
     loop = asyncio.get_running_loop()
     results = await loop.run_in_executor(None, rm.os_search, q_emb, top_k)
     return {
@@ -542,13 +573,16 @@ async def search_opensearch_route(query: str = Body(...), top_k: int = 5):
 
 
 @app.post("/ask")
-async def ask_route(query: str = Body(...), top_k: int = 5):
+async def ask_route(query: str = Body(...), top_k: int = 3):
     """
-    API endpoint that processes a user query through the entire RAG pipeline.
+    API endpoint that processes a user query through the RAG pipeline:
+    1) Retrieval from OpenSearch
+    2) BlueHive generation
+    3) Redis caching
     """
     rm = get_rag_model()
     if not rm:
-        return {"error": "RAG Model not initialized"}
+        return {"error": "RAGModel not initialized"}
 
     answer = await rm.ask(query, top_k)
     return {"query": query, "answer": answer}
