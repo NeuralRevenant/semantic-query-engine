@@ -14,22 +14,12 @@ from fastapi import FastAPI, Body
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
 
-##########################################
-# DistilBERT inference utilities #
-##########################################
-import torch
-from pathlib import Path
-from transformers import (
-    DistilBertTokenizerFast,
-    DistilBertForSequenceClassification,
-)
-
 # ==============================================================================
 # Global Constants & Configuration
 # ==============================================================================
-OLLAMA_API_URL = ""
+OLLAMA_API_URL = "http://localhost:11434/api"
 
-EMBED_MODEL_NAME = "jina/jina-embeddings-v2-base-de"
+EMBED_MODEL_NAME = "jina/jina-embeddings-v2-base-de:latest"
 
 MAX_BLUEHIVE_CONCURRENCY = 5
 MAX_EMBED_CONCURRENCY = 5
@@ -46,114 +36,7 @@ REDIS_MAX_ITEMS = 1000
 REDIS_CACHE_LIST = "query_cache_lfu"
 CACHE_SIM_THRESHOLD = 0.96
 
-PMC_DIR = "./PMC"
-
-DISTILBERT_MODEL_DIR = Path("")
-
-# Attempt to detect which device we should use for DistilBERT
-# Priority: CUDA -> MPS -> CPU
-if torch.cuda.is_available():
-    _distilbert_device = torch.device("cuda")
-    _distilbert_dtype = torch.float16  # Use FP16 on NVIDIA GPUs
-elif torch.backends.mps.is_available():
-    _distilbert_device = torch.device("mps")
-    _distilbert_dtype = torch.float32  # Use FP32 on Apple Silicon GPUs
-else:
-    _distilbert_device = torch.device("cpu")
-    _distilbert_dtype = torch.float32  # CPU => FP32
-
-_distilbert_tokenizer = None
-_distilbert_model = None
-
-if DISTILBERT_MODEL_DIR.is_dir():
-    try:
-        print(f"[INFO] Loading DistilBERT model from {DISTILBERT_MODEL_DIR}...")
-        _distilbert_tokenizer = DistilBertTokenizerFast.from_pretrained(
-            str(DISTILBERT_MODEL_DIR)
-        )
-        _distilbert_model = DistilBertForSequenceClassification.from_pretrained(
-            str(DISTILBERT_MODEL_DIR)
-        )
-
-        # Put the model in eval mode and cast to proper dtype for the device
-        _distilbert_model.eval()
-
-        # For CUDA, cast model weights to FP16
-        if _distilbert_device.type == "cuda":
-            _distilbert_model = _distilbert_model.half()
-
-        _distilbert_model.to(_distilbert_device, dtype=_distilbert_dtype)
-
-        print(
-            f"[INFO] DistilBERT loaded on {_distilbert_device} (dtype={_distilbert_dtype})."
-        )
-    except Exception as e:
-        print(f"[WARNING] Could not load DistilBERT model: {e}")
-        _distilbert_tokenizer = None
-        _distilbert_model = None
-else:
-    print(
-        "[WARNING] DistilBERT model directory not found. Classification model not loaded."
-    )
-
-
-def classify_query_distilbert(query: str) -> Optional[str]:
-    """
-    Use the DistilBERT classification model to get the top label.
-    Returns predicted label or None if not loaded.
-    """
-    global _distilbert_model, _distilbert_tokenizer
-
-    if not _distilbert_model or not _distilbert_tokenizer:
-        return None
-
-    device = _distilbert_device
-    dtype = _distilbert_dtype
-
-    # Tokenize
-    inputs = _distilbert_tokenizer(
-        [query],
-        truncation=True,
-        padding=True,
-        max_length=128,
-        return_tensors="pt",
-    )
-
-    # Move inputs to the device; if CUDA, enable non_blocking transfers
-    if device.type == "cuda":
-        inputs = inputs.to(device, dtype=dtype, non_blocking=True)
-    else:
-        inputs = inputs.to(device, dtype=dtype)
-
-    # For inference, we combine inference_mode() + autocast only on CUDA
-    with torch.inference_mode():
-        if device.type == "cuda":
-            # Use automatic mixed precision on NVIDIA
-            with torch.amp.autocast(device_type="cuda", enabled=True):
-                outputs = _distilbert_model(**inputs)
-        else:
-            outputs = _distilbert_model(**inputs)
-
-        logits = outputs.logits
-        preds = torch.argmax(logits, dim=1).cpu().numpy()
-
-    id2label = _distilbert_model.config.id2label
-    if not id2label:
-        return None
-
-    return id2label[int(preds[0])]
-
-
-def is_complex_query(query: str) -> bool:
-    """
-    Determine if a query is "complex" using DistilBERT classification output.
-    """
-    distil_label = classify_query_distilbert(query)
-    if distil_label and distil_label.lower() == "complex":
-        return True
-
-    return False
-
+PMC_DIR = "../PMC"
 
 # ==============================================================================
 # Redis Client & Cache Functions
@@ -170,7 +53,7 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def lfu_cache_get(query_emb: np.ndarray) -> Optional[str]:
-    """Retrieve from Redis if we find a sufficiently similar embedding."""
+    """Retrieve a cached answer if we find a sufficiently similar embedding."""
     cached_list = redis_client.lrange(REDIS_CACHE_LIST, 0, -1)
     if not cached_list:
         return None
@@ -224,7 +107,7 @@ def _remove_least_frequent_item():
 
 
 def lfu_cache_put(query_emb: np.ndarray, response: str):
-    """Insert new entry into the LFU Redis cache."""
+    """Insert a new entry into the LFU Redis cache."""
     entry = {"embedding": query_emb.tolist()[0], "response": response, "freq": 1}
     current_len = redis_client.llen(REDIS_CACHE_LIST)
     if current_len >= REDIS_MAX_ITEMS:
@@ -294,7 +177,7 @@ BLUEHIVE_SEMAPHORE = asyncio.Semaphore(MAX_BLUEHIVE_CONCURRENCY)
 async def bluehive_generate_text(prompt: str, system_msg: str = "") -> str:
     """
     Asynchronously call BlueHive's /api/v1/completion endpoint.
-    We pass a systemMessage plus the user prompt, and parse out the assistant's content.
+    Passing a systemMessage plus the user prompt, and parse out the assistant's content.
     """
     headers = {
         "Authorization": f"Bearer {BLUEHIVE_BEARER_TOKEN}",
@@ -307,91 +190,42 @@ async def bluehive_generate_text(prompt: str, system_msg: str = "") -> str:
         "systemMessage": system_msg,
     }
 
-    async with BLUEHIVE_SEMAPHORE:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json=payload, headers=headers, timeout=30.0)
-            resp.raise_for_status()
-            data = resp.json()
+    try:
+        async with BLUEHIVE_SEMAPHORE:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    url, json=payload, headers=headers, timeout=30.0
+                )
+                resp.raise_for_status()
+                data = resp.json()
 
-    # expecting data["choices"][0]["message"]["content"]
-    choices = data.get("choices", [])
-    if not choices:
-        return "[ERROR] No choices in BlueHive response."
+        # expecting data["choices"][0]["message"]["content"]
+        choices = data.get("choices", [])
+        if not choices:
+            return "[ERROR] No choices in BlueHive response."
 
-    first_choice = choices[0]
-    message = first_choice.get("message", {})
-    content = message.get("content", "")
-    return content.strip()
-
-
-# ==============================================================================
-# Multi-Hop Retrieval
-# ==============================================================================
-async def multi_hop_retrieve(
-    query: str, rag_model: "RAGModel", top_k: int = 3, max_hops: int = 2
-) -> Dict[str, str]:
-    """
-    Multi-hop retrieval approach:
-      1. Detect if query is complex.
-      2. If not complex, just do a single search => return.
-      3. If complex, do multiple hops:
-         - Retrieve top_k results.
-         - Parse top documents for additional keywords/phrases (subqueries).
-         - For each subquery, retrieve top_k results again.
-      4. Merge all retrieved results into final_context_map.
-    """
-    complex_flag = is_complex_query(query)
-    final_context_map: Dict[str, str] = {}
-
-    # Single-hop for simpler queries
-    if not complex_flag:
-        q_emb = await embed_query(query)
-        partial_results = rag_model.os_search(q_emb, top_k)
-        for doc_dict, _score in partial_results:
-            doc_id = doc_dict["doc_id"]
-            text_chunk = doc_dict["text"]
-            if doc_id not in final_context_map:
-                final_context_map[doc_id] = text_chunk
-            else:
-                final_context_map[doc_id] += "\n" + text_chunk
-        return final_context_map
-
-    # Multi-hop approach for more complex queries
-    q_emb = await embed_query(query)
-    top_results_store: List[Tuple[str, str]] = []
-
-    partial_results = rag_model.os_search(q_emb, top_k)
-    for doc_dict, _score in partial_results:
-        doc_id = doc_dict["doc_id"]
-        text_chunk = doc_dict["text"]
-        top_results_store.append((doc_id, text_chunk))
-        if doc_id not in final_context_map:
-            final_context_map[doc_id] = text_chunk
-        else:
-            final_context_map[doc_id] += "\n" + text_chunk
-
-    current_hop = 1
-    while current_hop < max_hops:
-        new_subqueries = extract_subqueries_from_docs(top_results_store)
-        if not new_subqueries:
-            break
-
-        top_results_store.clear()
-        for subq in new_subqueries:
-            subq_emb = await embed_query(subq)
-            partial_results = rag_model.os_search(subq_emb, top_k)
-            for doc_dict, _score in partial_results:
-                doc_id = doc_dict["doc_id"]
-                text_chunk = doc_dict["text"]
-                top_results_store.append((doc_id, text_chunk))
-                if doc_id not in final_context_map:
-                    final_context_map[doc_id] = text_chunk
-                else:
-                    final_context_map[doc_id] += "\n" + text_chunk
-
-        current_hop += 1
-
-    return final_context_map
+        first_choice = choices[0]
+        message = first_choice.get("message", {})
+        content = message.get("content", "")
+        return content.strip()
+    except httpx.HTTPStatusError as e:
+        # handling the HTTP errors gracefully
+        print(f"[ERROR] HTTPStatusError: {str(e)}")
+        print(f"[DEBUG] Response Status Code: {e.response.status_code}")
+        print(f"[DEBUG] Response Text: {e.response.text}")
+        # a user-friendly message returned
+        return (
+            "[ERROR] An unexpected error occurred.\n"
+            f"Status Code: {e.response.status_code}\n"
+        )
+    except httpx.RequestError as e:
+        # handle request level errors like any connection issues
+        print(f"[ERROR] RequestError: {str(e)}")
+        return "[ERROR] Failed connecting to the server. Please try again later."
+    except Exception as e:
+        # unexpected exceptions
+        print(f"[ERROR] Unexpected Exception: {str(e)}")
+        return "[ERROR] An unexpected error occurred. Please try again."
 
 
 # ==============================================================================
@@ -499,7 +333,7 @@ class OpenSearchIndexer:
             print(f"[OpenSearchIndexer] Bulk indexing error: {e}")
 
     def search(
-        self, query_emb: np.ndarray, k: int = 5
+        self, query_emb: np.ndarray, k: int = 3
     ) -> List[Tuple[Dict[str, str], float]]:
         if not self.client or query_emb.size == 0:
             return []
@@ -556,9 +390,7 @@ class RAGModel:
     - OpenSearch for ANN-based retrieval
     - Redis for caching
     - Ollama for embeddings
-    - BlueHive for text generation (replacing GPT-4 calls)
-    - DistilBERT classification for detecting complex queries
-    - Multi-hop retrieval (no query expansions)
+    - BlueHive for text generation
     """
 
     def __init__(self):
@@ -613,7 +445,7 @@ class RAGModel:
 
     def os_search(self, query_emb: np.ndarray, top_k: int = 3):
         """
-        Synchronous call to OpenSearch indexer.
+        Synchronous call to OpenSearch indexer for approximate k-NN retrieval.
         """
         if not self.os_indexer:
             return []
@@ -625,38 +457,46 @@ class RAGModel:
         Pipeline for a user query:
           1) Check if query is empty.
           2) Embed query, check Redis for a similar query.
-          3) If not cached, do multi-hop retrieval.
-          4) Call BlueHive with final combined context (via bluehive_generate_text).
+          3) If not cached, retrieve top_k results from OpenSearch.
+          4) Call BlueHive with final combined context.
           5) Cache new result to Redis.
           6) Return answer.
         """
         if not query.strip():
             return "[ERROR] Empty query."
 
+        # Check cache
         query_emb = await embed_query(query)
         cached_resp = lfu_cache_get(query_emb)
         if cached_resp is not None:
             print("[RAGModel] Found a similar query in Redis. Returning cached result.")
             return cached_resp
 
-        context_map = await multi_hop_retrieve(query, self, top_k=top_k, max_hops=2)
+        # OpenSearch Retrieval
+        partial_results = self.os_search(query_emb, top_k)
+        context_map = {}
+        for doc_dict, _score in partial_results:
+            doc_id = doc_dict["doc_id"]
+            text_chunk = doc_dict["text"]
+            if doc_id not in context_map:
+                context_map[doc_id] = text_chunk
+            else:
+                context_map[doc_id] += "\n" + text_chunk
 
+        # Build a short context
         context_text = ""
         for doc_id, doc_content in context_map.items():
-            context_text += f"--- Document: {doc_id} ---\n{doc_content}\n\n"
+            print(doc_id)
+            context_text += f"--- Document ID: {doc_id} ---\n{doc_content}\n\n"
 
-        # Construct a system message to set instructions, and user prompt
+        # Construct system and user prompts
         system_msg = (
-            "You are a helpful AI assistant. You must follow these rules:\n"
-            "1) Always cite document IDs from the context exactly as 'Document XYZ' without file extension.\n"
-            "Your answer must follow this format:\n"
-            "Direct Answer (at most 4 sentences)\n -> References (Document IDs used)\n"
-            "2) Do not add chain-of-thought.\n"
-            "3) You must answer exactly the user query and not the entire context.\n"
-            "4) Keep the answer short and precise (at most 4 sentences).\n"
-            "5) If you lack context, say so.\n"
+            "You are a helpful AI assistant chatbot. You must follow these rules:\n"
+            "1) Always cite document IDs from the context exactly as 'Document XYZ'.\n"
+            "2) Answer in at most 4 sentences.\n"
+            "3) If you lack context, say so.\n"
+            "4) Do not add chain-of-thought.\n"
         )
-
         final_prompt = (
             f"User Query:\n{query}\n\n"
             f"Context:\n{context_text}\n"
@@ -664,22 +504,12 @@ class RAGModel:
             "Provide your concise answer now."
         )
 
-        # final_prompt = (
-        #     "INSTRUCTIONS: You must cite the **Document ID or Name** for any information you use. "
-        #     "Your answer must follow this format:\n"
-        #     "Direct Answer (at most 4 sentences)\n -> References (Document IDs used)\n"
-        #     "If the Document ID is 'PMC12345.txt', refer to it as 'Document PMC12345'.\n"
-        #     "If multiple documents are relevant, cite each explicitly.\n"
-        #     "Do NOT reveal chain-of-thought. If insufficient info, say so.\n\n"
-        #     f"User Query:\n{query}\n\n"
-        #     f"Context:\n{context_text}\n"
-        #     "--- End of context ---\n\n"
-        #     "Provide your concise answer now."
-        # )
-
         answer = await bluehive_generate_text(
             prompt=final_prompt, system_msg=system_msg
         )
+        if not answer:
+            return "Error: No response was generated. Please try later!"
+
         lfu_cache_put(query_emb, answer)
         return answer
 
@@ -691,14 +521,11 @@ app = FastAPI(
     title="RAG with BlueHive + Jina Embeddings + OpenSearch + Redis",
     version="1.0.0",
     description=(
-        "A high-performance RAG pipeline using:\n"
+        "A simple RAG pipeline using:\n"
         "- BlueHive AI for text generation\n"
         "- Ollama's Jina embeddings for document/query embeddings\n"
         "- OpenSearch for ANN retrieval\n"
         "- Redis for caching\n"
-        "- DistilBERT-based classification for detecting complex queries\n"
-        "- Multi-hop retrieval (no query expansions)\n"
-        "Optimized for MPS (Apple Silicon), CUDA (NVIDIA GPUs), and CPU."
     ),
 )
 
@@ -748,8 +575,8 @@ async def search_opensearch_route(query: str = Body(...), top_k: int = 3):
 @app.post("/ask")
 async def ask_route(query: str = Body(...), top_k: int = 3):
     """
-    API endpoint that processes a user query through the entire RAG pipeline:
-    1) Multi-hop retrieval
+    API endpoint that processes a user query through the RAG pipeline:
+    1) Retrieval from OpenSearch
     2) BlueHive generation
     3) Redis caching
     """
