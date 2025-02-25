@@ -24,7 +24,9 @@ EMBED_MODEL_NAME = "jina/jina-embeddings-v2-base-de:latest"
 MAX_BLUEHIVE_CONCURRENCY = 5
 MAX_EMBED_CONCURRENCY = 5
 
-BLUEHIVE_BEARER_TOKEN = os.getenv("BLUEHIVE_BEARER_TOKEN", "")
+BLUEHIVE_BEARER_TOKEN = os.getenv(
+    "BLUEHIVE_BEARER_TOKEN", "BHSK-sandbox-GMzPgjm2dMqCDrhLUaq_CeBwo0KfnYLFuUXwkXOg"
+)
 
 BATCH_SIZE = 64
 CHUNK_SIZE = 512
@@ -496,6 +498,7 @@ class RAGModel:
             "2) Answer in at most 4 sentences.\n"
             "3) If you lack context, say so.\n"
             "4) Do not add chain-of-thought.\n"
+            "5) Never give responses based on your own knowledge of the user query, but only use the provided context to extract information to answer the user query.\n"
         )
         final_prompt = (
             f"User Query:\n{query}\n\n"
