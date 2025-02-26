@@ -1,7 +1,7 @@
 import os
 import json
 import numpy as np
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, AsyncGenerator
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -10,7 +10,7 @@ import httpx
 import uvicorn
 import redis
 
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, WebSocket, WebSocketDisconnect
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
 
@@ -213,19 +213,21 @@ async def bluehive_generate_text(prompt: str, system_msg: str = "") -> str:
         print(f"[ERROR] HTTPStatusError: {str(e)}")
         print(f"[DEBUG] Response Status Code: {e.response.status_code}")
         print(f"[DEBUG] Response Text: {e.response.text}")
-        # a user-friendly message returned
-        return (
-            "[ERROR] An unexpected error occurred.\n"
-            f"Status Code: {e.response.status_code}\n"
-        )
+        # return (
+        #     "[ERROR] An unexpected error occurred.\n"
+        #     f"Status Code: {e.response.status_code}\n"
+        # )
+        return None
     except httpx.RequestError as e:
         # handle request level errors like any connection issues
         print(f"[ERROR] RequestError: {str(e)}")
-        return "[ERROR] Failed connecting to the server. Please try again later."
+        # return "[ERROR] Failed connecting to the server. Please try again later."
+        return None
     except Exception as e:
         # unexpected exceptions
         print(f"[ERROR] Unexpected Exception: {str(e)}")
-        return "[ERROR] An unexpected error occurred. Please try again."
+        # return "[ERROR] An unexpected error occurred. Please try again."
+        return None
 
 
 # ==============================================================================
@@ -489,7 +491,7 @@ class RAGModel:
             print(doc_id)
             context_text += f"--- Document ID: {doc_id} ---\n{doc_content}\n\n"
 
-        # Construct system and user prompts
+        # system and user prompts
         system_msg = (
             "You are a helpful AI assistant chatbot. You must follow these rules:\n"
             "1) Always cite document IDs from the context exactly as 'Document XYZ' without any file extensions like '.txt'.\n"
@@ -498,7 +500,7 @@ class RAGModel:
             "4) Never ever give responses based on your own knowledge of the user query. Only use the provided context to extract information relevant to the question. You should not answer without document ID references from which the information was extracted.\n"
             "5) If you lack context, then say so.\n"
             "6) Do not add chain-of-thought.\n"
-            "7) Answer in at most 4 sentences.\n"
+            # "7) Answer in at most 4 sentences.\n"
         )
         final_prompt = (
             f"User Query:\n{query}\n\n"
@@ -524,11 +526,12 @@ app = FastAPI(
     title="RAG with BlueHive + Jina Embeddings + OpenSearch + Redis",
     version="1.0.0",
     description=(
-        "A simple RAG pipeline using:\n"
+        "RAG pipeline using:\n"
         "- BlueHive AI for text generation\n"
         "- Ollama's Jina embeddings for document/query embeddings\n"
         "- OpenSearch for ANN retrieval\n"
         "- Redis for caching\n"
+        "- HTTP + WebSockets for streaming tokens\n"
     ),
 )
 
@@ -589,6 +592,133 @@ async def ask_route(query: str = Body(...), top_k: int = 3):
 
     answer = await rm.ask(query, top_k)
     return {"query": query, "answer": answer}
+
+
+import openai
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+
+async def openai_generate_text_stream(
+    prompt: str, system_msg: str = ""
+) -> AsyncGenerator[str, None]:
+    """
+    Stream tokens or text chunks from OpenAI's GPT-4o model.
+    """
+    openai.api_key = OPENAI_API_KEY
+    try:
+        async with BLUEHIVE_SEMAPHORE:
+            # OpenAI streaming call
+            response = await openai.ChatCompletion.acreate(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=1024,
+                stream=True,  # enable token-by-token streaming
+                temperature=0.7,
+            )
+
+            # Yield each token or piece of text as it's generated
+            async for chunk in response:
+                if "choices" in chunk:
+                    delta = chunk["choices"][0]["delta"]
+                    token = delta.get("content", "")
+                    if token:
+                        yield token
+
+    except Exception as e:
+        # If the API or network fails mid stream, yield an error token or message
+        yield f"[ERROR] {str(e)}"
+
+
+@app.websocket("/ws/ask")
+async def ask_websocket_endpoint(websocket: WebSocket):
+    """
+    WebSocket endpoint for streaming RAG-based answers token-by-token.
+    Expects the client to send JSON: {"query": "...", "top_k": int}.
+    """
+    await websocket.accept()
+    try:
+        # Receive JSON from the client (the query + optional top_k)
+        data_str = await websocket.receive_text()
+        data = json.loads(data_str)
+        query = data.get("query", "")
+        if not query.strip():
+            await websocket.send_text("[ERROR] Empty query.")
+            await websocket.close()
+            return
+
+        top_k = data.get("top_k", 3)
+        rm = get_rag_model()
+        if not rm:
+            await websocket.send_text(json.dumps({"error": "RAGModel not initialized"}))
+            await websocket.close()
+            return
+
+        # Check Redis cache first
+        query_emb = await embed_query(query)
+        cached_resp = lfu_cache_get(query_emb)
+        if cached_resp:
+            # If there's a cached response, just send it either all at once or chunked
+            await websocket.send_text(cached_resp)
+            await websocket.close()
+            return
+
+        # Perform retrieval from OpenSearch
+        partial_results = rm.os_search(query_emb, top_k)
+        context_map = {}
+        for doc_dict, _score in partial_results:
+            doc_id = doc_dict["doc_id"]
+            text_chunk = doc_dict["text"]
+            if doc_id not in context_map:
+                context_map[doc_id] = text_chunk
+            else:
+                context_map[doc_id] += "\n" + text_chunk
+
+        # build the context prompt
+        context_text = ""
+        for doc_id, doc_content in context_map.items():
+            print(doc_id)
+            context_text += f"--- Document ID: {doc_id} ---\n{doc_content}\n\n"
+
+        system_msg = (
+            "You are a helpful AI assistant chatbot. You must follow these rules:\n"
+            "1) Always cite document IDs from the context exactly as 'Document XYZ' without any file extensions like '.txt'.\n"
+            "2) For every answer generated, there should be a reference or citation of the IDs of the documents from which the answer information was extracted at the end of the answer!\n"
+            "3) If the context does not relate to the query, say 'I lack the context to answer your question.' For example, if the query is about gene mutations but the context is about climate change, acknowledge the mismatch and do not answer.\n"
+            "4) Never ever give responses based on your own knowledge of the user query. Only use the provided context to extract information relevant to the question. You should not answer without document ID references from which the information was extracted.\n"
+            "5) If you lack context, then say so.\n"
+            "6) Do not add chain-of-thought.\n"
+            # "7) Answer in at most 4 sentences.\n"
+        )
+        final_prompt = (
+            f"User Query:\n{query}\n\n"
+            f"Context:\n{context_text}\n"
+            "--- End of context ---\n\n"
+            "Provide your concise answer now."
+        )
+
+        # stream the generation token-by-token
+        streamed_chunks = []
+        async for chunk in openai_generate_text_stream(final_prompt, system_msg):
+            streamed_chunks.append(chunk)
+            # Send each chunk immediately to the client
+            await websocket.send_text(chunk)
+
+        # After finishing, store the full response in Redis
+        final_answer = "".join(streamed_chunks)
+        if final_answer.strip():
+            lfu_cache_put(query_emb, final_answer)
+
+        await websocket.close()
+
+    except WebSocketDisconnect:
+        print("[WebSocket] Client disconnected mid-stream.")
+    except Exception as e:
+        print(f"[WebSocket] Unexpected error: {e}")
+        await websocket.close()
 
 
 if __name__ == "__main__":
