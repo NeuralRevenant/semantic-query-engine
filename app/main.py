@@ -19,18 +19,16 @@ from opensearchpy.helpers import bulk
 # ==============================================================================
 OLLAMA_API_URL = "http://localhost:11434/api"
 
-EMBED_MODEL_NAME = "jina/jina-embeddings-v2-base-de:latest"
+EMBED_MODEL_NAME = "mxbai-embed-large:latest"
 
 MAX_BLUEHIVE_CONCURRENCY = 5
 MAX_EMBED_CONCURRENCY = 5
 
-BLUEHIVE_BEARER_TOKEN = os.getenv(
-    "BLUEHIVE_BEARER_TOKEN", "BHSK-sandbox-GMzPgjm2dMqCDrhLUaq_CeBwo0KfnYLFuUXwkXOg"
-)
+BLUEHIVE_BEARER_TOKEN = os.getenv("BLUEHIVE_BEARER_TOKEN", "")
 
 BATCH_SIZE = 64
 CHUNK_SIZE = 512
-EMBED_DIM = 768
+EMBED_DIM = 1024
 
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
@@ -38,7 +36,7 @@ REDIS_MAX_ITEMS = 1000
 REDIS_CACHE_LIST = "query_cache_lfu"
 CACHE_SIM_THRESHOLD = 0.96
 
-PMC_DIR = "../PMC"
+PMC_DIR = "PMC"
 
 # ==============================================================================
 # Redis Client & Cache Functions
@@ -235,7 +233,7 @@ async def bluehive_generate_text(prompt: str, system_msg: str = "") -> str:
 # ==============================================================================
 OPENSEARCH_HOST = os.environ.get("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT = int(os.environ.get("OPENSEARCH_PORT", 9200))
-OPENSEARCH_INDEX_NAME = "medical-search-index"
+OPENSEARCH_INDEX_NAME = "medical-search-index2"
 
 os_client: Optional[OpenSearch] = None
 try:
@@ -263,14 +261,14 @@ try:
                             "name": "hnsw",
                             "engine": "nmslib",
                             "space_type": "cosinesimil",
-                            "parameters": {"m": 48, "ef_construction": 400},
+                            "parameters": {"m": 64, "ef_construction": 500},
                         },
                     },
                 }
             },
         }
         resp = os_client.indices.create(index=OPENSEARCH_INDEX_NAME, body=index_body)
-        print(f"[INFO] Created '{OPENSEARCH_INDEX_NAME}' index with HNSW: {resp}")
+        print(f"[INFO] Created '{OPENSEARCH_INDEX_NAME}' index with HNSW.")
     else:
         print(f"[INFO] OpenSearch index '{OPENSEARCH_INDEX_NAME}' is ready.")
 except Exception as e:
@@ -494,11 +492,13 @@ class RAGModel:
         # Construct system and user prompts
         system_msg = (
             "You are a helpful AI assistant chatbot. You must follow these rules:\n"
-            "1) Always cite document IDs from the context exactly as 'Document XYZ'.\n"
-            "2) Answer in at most 4 sentences.\n"
-            "3) If you lack context, say so.\n"
-            "4) Do not add chain-of-thought.\n"
-            "5) Never give responses based on your own knowledge of the user query, but only use the provided context to extract information to answer the user query.\n"
+            "1) Always cite document IDs from the context exactly as 'Document XYZ' without any file extensions like '.txt'.\n"
+            "2) For every answer generated, there should be a reference or citation of the IDs of the documents from which the answer information was extracted at the end of the answer!\n"
+            "3) If the context does not relate to the query, say 'I lack the context to answer your question.' For example, if the query is about gene mutations but the context is about climate change, acknowledge the mismatch and do not answer.\n"
+            "4) Never ever give responses based on your own knowledge of the user query. Only use the provided context to extract information relevant to the question. You should not answer without document ID references from which the information was extracted.\n"
+            "5) If you lack context, then say so.\n"
+            "6) Do not add chain-of-thought.\n"
+            "7) Answer in at most 4 sentences.\n"
         )
         final_prompt = (
             f"User Query:\n{query}\n\n"
