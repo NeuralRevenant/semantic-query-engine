@@ -1,6 +1,6 @@
 # **RAG-Based Medical Semantic Search & Query Answering System**
 
-A Retrieval-Augmented Generation (RAG) application designed for **semantic search and intelligent query answering** on medical and EHR documents. This system seamlessly integrates **Ollama's jina/jina-embeddings-v2-base-de** for high-quality embeddings and **BlueHiveAI** LLMs for context-aware text generation. It leverages **OpenSearch** for efficient **Approximate Nearest Neighbor** (ANN) vector searches and utilizes **Redis** for intelligent query caching, ensuring accurate responses with consistent near real-time latencies (<3.5s).
+A Retrieval-Augmented Generation (RAG) application designed for **semantic search and intelligent query answering** on medical and EHR documents. This system seamlessly integrates **Ollama's jina/jina-embeddings-v2-base-de** for high-quality embeddings, **BlueHiveAI** and **OpenAI** LLMs for context-aware text generation. It leverages **OpenSearch** for efficient **Approximate Nearest Neighbor** (ANN) vector searches and utilizes **Redis** for intelligent query caching, ensuring accurate responses with consistent near real-time latencies (<3.5s).
 
 ---
 
@@ -29,12 +29,14 @@ flowchart TD
     direction TB
         C["POST /search/opensearch"]
         D["POST /ask"]
+        W["WS /ws/ask"]
   end
  subgraph RAG_Model["RAG Architecture"]
     direction TB
         E["Embeddings"]
         F["Retrieval"]
-        G["BlueHiveAI API"]
+        G1["BlueHive AI LLM"]
+        G2["OpenAI LLM"]
         H["Redis Caching"]
   end
  subgraph Redis["Redis Instance"]
@@ -52,15 +54,21 @@ flowchart TD
   end
  subgraph BlueHive["BlueHive"]
     direction TB
-        N["BlueHiveAI Model"]
+        N["BlueHive AI Model"]
   end
-    n1["Users"] --> C & D
-    D --> E & F & G & H
+ subgraph OpenAI["OpenAI"]
+    direction TB
+        O["OpenAI GPT-4o Model"]
+  end
+    n1["Users"] --> C & D & W
+    W --> E & F & G2 & H
+    D --> E & F & G1 & H
     H --> I
     E --> J
     F --> L
     L --> M
-    G --> N
+    G1 --> N
+    G2 --> O
     C --> E & F
 ```
 
@@ -94,7 +102,7 @@ flowchart TD
 3. **ANN-Based Retrieval**:
    - If no cache hit, **OpenSearch** performs **HNSW ANN** retrieval to find the most relevant document chunks.
 4. **Contextual Response Generation**:
-   - Retrieved context is sent to **BlueHiveAI** for final answer generation.
+   - Retrieved context is sent to **BlueHiveAI** or **OpenAI** for final answer generation.
    - The response is stored in Redis for future queries, optimizing performance.
 
 ---
@@ -125,6 +133,7 @@ The system is architected as a **microservices-based RAG pipeline** with the fol
 - **OpenSearch**: Stores indexed document embeddings and performs **HNSW ANN** retrieval.
 - **Redis**: Caches query embeddings and responses for efficient lookups.
 - **BlueHiveAI**: Handles text generation using retrieved context, ensuring intelligent and context-aware answers.
+- **OpenAI**: Handles text generation with the retrieved context using the **'streaming'** mode, ensuring intelligent and context-aware answers with additional usability in WebSocket based APIs and not just HTTP.
 
 ---
 
@@ -162,7 +171,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ### **3. Dynamic Query Handling**
 - Queries first check **Redis cache** for stored responses.
 - If no cached response is found, **OpenSearch** retrieves relevant documents.
-- **BlueHiveAI** generates final responses based on retrieved context.
+- **BlueHiveAI** or **OpenAI** generates final responses based on retrieved context.
 - The new query-response pair is cached in Redis for future lookups.
 
 ---
@@ -171,7 +180,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 - **OpenSearch** supports indexing **millions of documents** for scalable retrieval.
 - **Redis caching** significantly reduces response latency.
 - **Ollama's jina/jina-embeddings-v2-base-de** ensures accurate semantic understanding.
-- **BlueHiveAI** provides context-aware text generation with consistent latencies <3.5s.
+- **BlueHiveAI** or **OpenAI** provides context-aware text generation with consistent latencies <3.5s.
 
 ---
 
