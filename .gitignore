@@ -1,6 +1,7 @@
 .DS_Store
 __pycache__/
 .venv/
+.env
 relevant_SS
 rag_env
 RAG.drawio

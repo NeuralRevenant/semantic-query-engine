@@ -523,11 +523,11 @@ class RAGModel:
 # FastAPI Application Setup
 # ==============================================================================
 app = FastAPI(
-    title="RAG with BlueHive + Jina Embeddings + OpenSearch + Redis",
+    title="RAG with BlueHive/OpenAI + Jina Embeddings + OpenSearch + Redis",
     version="1.0.0",
     description=(
         "RAG pipeline using:\n"
-        "- BlueHive AI for text generation\n"
+        "- BlueHive AI/OpenAI for text generation\n"
         "- Ollama's Jina embeddings for document/query embeddings\n"
         "- OpenSearch for ANN retrieval\n"
         "- Redis for caching\n"
@@ -555,37 +555,20 @@ def get_rag_model() -> RAGModel:
     return rag_model
 
 
-@app.post("/search/opensearch")
-async def search_opensearch_route(query: str = Body(...), top_k: int = 3):
-    """
-    API endpoint for performing approximate k-NN search via OpenSearch.
-    (Embeds the query with JinaAI, then searches in OpenSearch.)
-    """
-    rm = get_rag_model()
-    if not rm:
-        return {"error": "RAGModel not initialized."}
-
-    q_emb = await embed_query(query)
-    loop = asyncio.get_running_loop()
-    results = await loop.run_in_executor(None, rm.os_search, q_emb, top_k)
-    return {
-        "query": query,
-        "top_k": top_k,
-        "results": [
-            {"doc_id": r[0]["doc_id"], "text": r[0]["text"], "score": r[1]}
-            for r in results
-        ],
-    }
-
-
 @app.post("/ask")
-async def ask_route(query: str = Body(...), top_k: int = 3):
+async def ask_route(payload: dict = Body(...)):
     """
     API endpoint that processes a user query through the RAG pipeline:
     1) Retrieval from OpenSearch
     2) BlueHive generation
     3) Redis caching
     """
+    query: str = payload.get("query", "")
+    if not query.strip():
+        return {"query": "", "answer": "[ERROR] Empty query."}
+
+    top_k = payload.get("top_k", 3)
+    print(f"[Debug] query = {query}, top_k = {top_k}")
     rm = get_rag_model()
     if not rm:
         return {"error": "RAGModel not initialized"}
@@ -644,7 +627,7 @@ async def ask_websocket_endpoint(websocket: WebSocket):
         # Receive JSON from the client (the query + optional top_k)
         data_str = await websocket.receive_text()
         data = json.loads(data_str)
-        query = data.get("query", "")
+        query: str = data.get("query", "")
         if not query.strip():
             await websocket.send_text("[ERROR] Empty query.")
             await websocket.close()
