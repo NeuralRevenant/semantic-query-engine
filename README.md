@@ -27,9 +27,8 @@ config:
 flowchart TD
  subgraph FastAPI["Semantic Query Engine - FastAPI Endpoints"]
     direction TB
-        C["POST /search/opensearch"]
-        D["POST /ask"]
-        W["WS /ws/ask"]
+        C["POST /ask"]
+        D["WS /ws/ask"]
   end
  subgraph RAG_Model["RAG Architecture"]
     direction TB
@@ -60,16 +59,15 @@ flowchart TD
     direction TB
         O["OpenAI GPT-4o Model"]
   end
-    n1["Users"] --> C & D & W
-    W --> E & F & G2 & H
-    D --> E & F & G1 & H
+    n1["Users"] --> C & D
+    D --> E & F & G2 & H
+    C --> E & F & G1 & H
     H --> I
     E --> J
     F --> L
     L --> M
     G1 --> N
     G2 --> O
-    C --> E & F
 ```
 
 ---
