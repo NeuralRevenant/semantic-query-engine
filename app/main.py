@@ -1,4 +1,5 @@
 import os
+from dotenv import load_dotenv
 import json
 import numpy as np
 from typing import List, Tuple, Optional, Dict, AsyncGenerator
@@ -14,12 +15,14 @@ from fastapi import FastAPI, Body, WebSocket, WebSocketDisconnect
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
 
+# Load .env file
+load_dotenv()
+
 # ==============================================================================
 # Global Constants & Configuration
 # ==============================================================================
-OLLAMA_API_URL = "http://localhost:11434/api"
-
-EMBED_MODEL_NAME = "mxbai-embed-large:latest"
+OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api")
+EMBED_MODEL_NAME = os.getenv("OLLAMA_EMBED_MODEL", "mxbai-embed-large:latest")
 
 MAX_BLUEHIVE_CONCURRENCY = 5
 MAX_EMBED_CONCURRENCY = 5
@@ -183,7 +186,7 @@ async def bluehive_generate_text(prompt: str, system_msg: str = "") -> str:
         "Authorization": f"Bearer {BLUEHIVE_BEARER_TOKEN}",
         "Content-Type": "application/json",
     }
-    url = "https://ai.bluehive.com/api/v1/completion"
+    url = os.getenv("BLUEHIVEAI_URL", "")
 
     payload = {
         "prompt": prompt,
@@ -235,7 +238,7 @@ async def bluehive_generate_text(prompt: str, system_msg: str = "") -> str:
 # ==============================================================================
 OPENSEARCH_HOST = os.environ.get("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT = int(os.environ.get("OPENSEARCH_PORT", 9200))
-OPENSEARCH_INDEX_NAME = "medical-search-index2"
+OPENSEARCH_INDEX_NAME = os.getenv("OPENSEARCH_INDEX_NAME", "")
 
 os_client: Optional[OpenSearch] = None
 try:
