@@ -1,13 +1,17 @@
 numpy
 fastapi
-uvicorn\[standard\]
+uvicorn[standard]
 redis
 opensearch-py
-httpx  # for async HTTP calls to Ollama
-openai  # for OpenAI GPT-4 API calls
-python-dotenv  # To manage environment variables like OPENAI_API_KEY from a .env file
-
-# Machine learning libraries for embeddings (if required elsewhere in the code)
+httpx  # async HTTP calls
+openai  # OpenAI GPT-4o API calls
+python-dotenv
+asyncpg
+psycopg2
 torch>=1.13.1
-transformers>=4.27.0
+transformers>=4.27.0 # intent classification
 sentence-transformers>=2.2.2
+langchain  # core LangChain lib
+langchain-community  # community extensions for LangChain
+langchain-openai  # openAI-specific LangChain integration
+spacy  # NER

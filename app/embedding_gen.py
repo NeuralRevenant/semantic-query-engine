@@ -14,6 +14,10 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
 
+import psycopg2
+import psycopg2.extras
+import asyncpg
+
 ###############################################################################
 # Load Environment Variables
 ###############################################################################
@@ -37,6 +41,13 @@ BASE_OPENSEARCH_INDEX_NAME = os.getenv("OPENSEARCH_INDEX_NAME", "")
 OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", 9200))
 
+# PostgreSQL credentials
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "")
+POSTGRES_DB = os.getenv("POSTGRES_DB", "")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", 5432))
+
 ###############################################################################
 # FastAPI Application
 ###############################################################################
@@ -45,9 +56,9 @@ app = FastAPI(
     version="1.0.0",
     description=(
         "A microservice that:\n"
-        "1. Accepts a text file + user_id.\n"
-        "2. Derives a single doc_id from the file name + timestamp.\n"
-        "3. Stores the file in 'uploads/{user_id}/doc_id.ext'.\n"
+        "1. Accepts text files + user_id.\n"
+        "2. Derives doc_id from the file names + timestamps.\n"
+        "3. Stores the files in 'uploads/{user_id}/doc_id.ext'.\n"
         "4. Chunks & embeds the text.\n"
         "5. Indexes all chunks under the same doc_id in the user-specific OpenSearch index.\n"
     ),
@@ -206,7 +217,7 @@ def bulk_index_embeddings(
 
     actions = []
     for i, (chunk, emb) in enumerate(zip(chunks, embeddings_normed)):
-        # keep _id unique by appending the chunk idx
+        # keep chunk embedding '_id' unique by appending the chunk idx
         open_search_id = f"{doc_id}_{i}"
         source_doc = {
             "doc_id": doc_id,
@@ -247,83 +258,155 @@ def bulk_index_embeddings(
 
 
 ###############################################################################
+# PostgreSQL Connection & Authorization
+###############################################################################
+async def get_pg_connection():
+    """
+    Creates a new async PostgreSQL connection.
+    Uses asyncpg for non-blocking operations.
+    """
+    try:
+        conn = await asyncpg.connect(
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            database=POSTGRES_DB,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+        )
+        return conn
+    except Exception as exc:
+        print(f"[ERROR] Unable to connect to PostgreSQL: {exc}")
+        return None
+
+
+async def check_user_authorized_in_postgres(user_id: str) -> bool:
+    """
+    Asynchronously checks if the user exists in the PostgreSQL database.
+
+    1) Connects to Postgres using asyncpg.
+    2) Queries the 'users' table to check if the user exists.
+    3) Returns True if user is found & valid, otherwise False.
+    """
+    conn = await get_pg_connection()
+    if not conn:
+        print("[ERROR] Can't connect to Postgres => cannot verify user.")
+        return False
+
+    try:
+        row = await conn.fetchrow("SELECT id, email FROM users WHERE id = $1;", user_id)
+
+        if not row or not all(
+            row.get(col) and str(row[col]).strip() for col in ["id", "email"]
+        ):
+            print(f"[AUTH] No valid user found with id={user_id}")
+            return False
+
+        return True
+    except Exception as exc:
+        print(f"[ERROR] Postgres query failed: {exc}")
+        return False
+    finally:
+        await conn.close()
+
+
+###############################################################################
 # Endpoint: Upload & Store
 ###############################################################################
 @app.post("/upload_text")
 async def upload_text(
     user_id: str = Form(...),
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),
 ):
     """
-    1) Derive doc_id from filename + timestamp
-    2) Save file => uploads/{user_id}/doc_id.ext
-    3) Read & chunk text
-    4) Embeddings => user-specific index, doc_id repeated for all chunks
+    1) Validate the user via PostgreSQL calls
+    2) Derive doc_id from filename + timestamp
+    3) Save file => uploads/{user_id}/doc_id.ext
+    4) Read & chunk text
+    5) Embeddings => user-specific index, doc_id repeated for all chunks
     """
 
-    # Validate the filename
-    if not file.filename.strip():
-        raise HTTPException(status_code=400, detail="No valid filename provided.")
+    is_authorized = await check_user_authorized_in_postgres(user_id)
+    if not is_authorized:
+        raise HTTPException(
+            status_code=403,
+            detail=f"User with id='{user_id}' does not exist or is not authorized.",
+        )
 
-    if not user_id.strip():
-        raise HTTPException(status_code=400, detail="No valid user-id provided.")
-
-    # Derive doc_id from name + timestamp
-    name_stem = pathlib.Path(file.filename).stem  # "report" from "report.txt"
-    now_ts = int(time.time())
-    doc_id = f"{name_stem}_{now_ts}"  # ex: "report_1692300000"
+    # If no files are provided
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded.")
 
     # Make user-specific folder
     user_folder = os.path.join(BASE_UPLOAD_DIR, user_id)
     os.makedirs(user_folder, exist_ok=True)
 
-    # Build final filename
-    extension = pathlib.Path(file.filename).suffix
-    final_filename = f"{doc_id}{extension}"  # "report_1692300000.txt"
-    final_path = os.path.join(user_folder, final_filename)
+    for uploaded_file in files:
+        # basic filename checks
+        if not uploaded_file.filename.strip():
+            raise HTTPException(status_code=400, detail="A file has no valid filename.")
 
-    # Save file
-    try:
-        with open(final_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"File save error: {exc}")
+        extension = pathlib.Path(uploaded_file.filename).suffix.lower()
+        if extension != ".txt":
+            raise HTTPException(
+                status_code=403,
+                detail=f"Invalid file format: {extension}. Only .txt allowed!",
+            )
 
-    # Read file text
-    try:
-        with open(final_path, "r", encoding="utf-8") as f:
-            contents = f.read()
-    except UnicodeDecodeError:
-        with open(final_path, "r", encoding="latin-1") as f:
-            contents = f.read()
+        # derive doc_id: stem + timestamp
+        name_stem = pathlib.Path(uploaded_file.filename).stem
+        now_ts = int(time.time())
+        doc_id = f"{name_stem}_{now_ts}"
 
-    if not contents.strip():
-        raise HTTPException(
-            status_code=400, detail="File is empty or contains no text."
-        )
+        # final path: uploads/user_id/doc_id.txt
+        final_filename = f"{doc_id}{extension}"
+        final_path = os.path.join(user_folder, final_filename)
 
-    # Chunk text
-    chunks = chunk_text(contents, CHUNK_SIZE)
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No text chunks generated.")
+        # save the file
+        try:
+            with open(final_path, "wb") as buffer:
+                shutil.copyfileobj(uploaded_file.file, buffer)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"File save error for '{uploaded_file.filename}': {exc}",
+            )
 
-    # Embed
-    embeddings = await embed_texts_in_batches(chunks)
-    if embeddings.shape[0] != len(chunks):
-        raise HTTPException(
-            status_code=500, detail="Mismatch in chunk vs embedding counts!"
-        )
+        # Read file text
+        try:
+            with open(final_path, "r", encoding="utf-8") as f:
+                contents = f.read()
+        except UnicodeDecodeError:
+            with open(final_path, "r", encoding="latin-1") as f:
+                contents = f.read()
 
-    # Index
-    bulk_index_embeddings(user_id, doc_id, embeddings, chunks)
+        if not contents.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"File '{uploaded_file.filename}' is empty or has no text.",
+            )
 
-    return {
-        "user_id": user_id,
-        "doc_id": doc_id,
-        "saved_file": final_path,
-        "num_chunks": len(chunks),
-        "message": f"Uploaded '{file.filename}' & embedded for user='{user_id}' doc_id='{doc_id}'.",
-    }
+        # Chunk text
+        chunks = chunk_text(contents, CHUNK_SIZE)
+        if not chunks:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File '{uploaded_file.filename}' produced no text chunks.",
+            )
+
+        # embed
+        embeddings = await embed_texts_in_batches(chunks)
+        if embeddings.shape[0] != len(chunks):
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Mismatch in chunk vs embedding counts for file '{uploaded_file.filename}'."
+                ),
+            )
+
+        # index => user-specific doc_id
+        bulk_index_embeddings(user_id, doc_id, embeddings, chunks)
+
+    return f"Uploaded {len(files)} files & embedded documents for user='{user_id}'."
 
 
 if __name__ == "__main__":

@@ -39,7 +39,7 @@ REDIS_MAX_ITEMS = 1000
 REDIS_CACHE_LIST = "query_cache_lfu"
 CACHE_SIM_THRESHOLD = 0.96
 
-PMC_DIR = "PMC"
+PMC_DIR = os.getenv("EMB_DIR", "PMC")
 
 # ==============================================================================
 # Redis Client & Cache Functions

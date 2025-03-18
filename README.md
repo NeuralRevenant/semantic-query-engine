@@ -1,6 +1,6 @@
 # **RAG-Based Medical Semantic Search & Query Answering System**
 
-A Retrieval-Augmented Generation (RAG) application designed for **semantic search and intelligent query answering** on medical and EHR documents. This system seamlessly integrates **Ollama's jina/jina-embeddings-v2-base-de** for high-quality embeddings, **BlueHiveAI** and **OpenAI** LLMs for context-aware text generation. It leverages **OpenSearch** for efficient **Approximate Nearest Neighbor** (ANN) vector searches and utilizes **Redis** for intelligent query caching, ensuring accurate responses with consistent near real-time latencies (<3.5s).
+A Retrieval-Augmented Generation (RAG) application designed for **semantic search and intelligent query answering** on medical and EHR documents. This system seamlessly integrates **Ollama's embedding models** for high-quality embeddings, **BlueHiveAI** and **OpenAI** LLMs for context-aware text generation. It leverages **OpenSearch** for efficient **Approximate Nearest Neighbor** (ANN) vector searches and utilizes **Redis** for intelligent query caching, ensuring accurate responses with consistent near real-time latencies (<3.5s).
 
 ---
 
@@ -73,7 +73,7 @@ flowchart TD
 ---
 
 ## **Key Features**
-- **Semantic Search**: Utilizes **jina/jina-embeddings-v2-base-de** (768-dimensional vectors) through Ollama to generate high-dimensional semantic representations of text.
+- **Semantic Search**: Utilizes **mxbai-embed-large:latest** (1024-dimensional vectors) through Ollama to generate high-dimensional semantic representations of text.
 - **Retrieval-Augmented Generation (RAG)**: Combines **OpenSearch** for vector-based ANN retrieval with **BlueHiveAI** for advanced query answering.
 - **Efficient Caching**:
   - **Redis** stores query embeddings and responses to reduce latency and optimize performance.
@@ -93,7 +93,7 @@ flowchart TD
 
 ## **How It Works**
 1. **Embedding Generation**:
-   - Input text is converted into embeddings using **jina/jina-embeddings-v2-base-de** via Ollama.
+   - Input text is converted into embeddings using **mxbai-embed-large:latest** via Ollama.
 2. **Query Caching**:
    - Query embeddings are compared with cached results in **Redis**.
    - If a similar query is found, the cached response is returned, reducing latency.
@@ -127,7 +127,7 @@ flowchart TD
 ## **Architecture Overview**
 The system is architected as a **microservices-based RAG pipeline** with the following components:
 - **FastAPI**: Exposes RESTful endpoints for query input and response output.
-- **Ollama Embedding Service**: Generates high-dimensional embeddings using **jina/jina-embeddings-v2-base-de**.
+- **Ollama Embedding Service**: Generates high-dimensional embeddings using **mxbai-embed-large:latest**.
 - **OpenSearch**: Stores indexed document embeddings and performs **HNSW ANN** retrieval.
 - **Redis**: Caches query embeddings and responses for efficient lookups.
 - **BlueHiveAI**: Handles text generation using retrieved context, ensuring intelligent and context-aware answers.
@@ -177,7 +177,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ## **Scalability & Performance**
 - **OpenSearch** supports indexing **millions of documents** for scalable retrieval.
 - **Redis caching** significantly reduces response latency.
-- **Ollama's jina/jina-embeddings-v2-base-de** ensures accurate semantic understanding.
+- **Ollama's embedding model** ensures accurate semantic understanding.
 - **BlueHiveAI** or **OpenAI** provides context-aware text generation with consistent latencies <3.5s.
 
 ---
