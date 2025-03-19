@@ -15,6 +15,10 @@ from fastapi import FastAPI, Body, WebSocket, WebSocketDisconnect
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from opensearchpy.helpers import bulk
 
+import spacy
+from langchain.memory import ConversationBufferMemory
+
+
 # Load .env file
 load_dotenv()
 
@@ -39,7 +43,12 @@ REDIS_MAX_ITEMS = 1000
 REDIS_CACHE_LIST = "query_cache_lfu"
 CACHE_SIM_THRESHOLD = 0.96
 
-PMC_DIR = os.getenv("EMB_DIR", "PMC")
+EMB_DIR = os.getenv("EMB_DIR", "notes")  # Directory for plain-text notes
+
+OPENSEARCH_HOST = os.environ.get("OPENSEARCH_HOST", "localhost")
+OPENSEARCH_PORT = int(os.environ.get("OPENSEARCH_PORT", 9200))
+OPENSEARCH_INDEX_NAME = os.getenv("OPENSEARCH_INDEX_NAME", "")
+
 
 # ==============================================================================
 # Redis Client & Cache Functions
@@ -236,9 +245,7 @@ async def bluehive_generate_text(prompt: str, system_msg: str = "") -> str:
 # ==============================================================================
 # OpenSearch Setup with HNSW ANN
 # ==============================================================================
-OPENSEARCH_HOST = os.environ.get("OPENSEARCH_HOST", "localhost")
-OPENSEARCH_PORT = int(os.environ.get("OPENSEARCH_PORT", 9200))
-OPENSEARCH_INDEX_NAME = os.getenv("OPENSEARCH_INDEX_NAME", "")
+
 
 os_client: Optional[OpenSearch] = None
 try:
@@ -457,7 +464,7 @@ class RAGModel:
 
         return self.os_indexer.search(query_emb, k=top_k)
 
-    async def ask(self, query: str, top_k: int = 3) -> str:
+    async def ask(self, query: str, chat_id: str = None, top_k: int = 3) -> str:
         """
         Pipeline for a user query:
           1) Check if query is empty.
@@ -470,10 +477,21 @@ class RAGModel:
         if not query.strip():
             return "[ERROR] Empty query."
 
+        if not chat_id:
+            return "[ERROR] Incorrect account/chat details!"
+
+        # load or init memory for this chat session
+        if chat_id not in self.memory_store:
+            self.memory_store[chat_id] = ConversationBufferMemory(
+                memory_key="chat_history", return_messages=True
+            )
+
+        memory = self.memory_store[chat_id]
+
         # Check cache
         query_emb = await embed_query(query)
         cached_resp = lfu_cache_get(query_emb)
-        if cached_resp is not None:
+        if cached_resp:
             print("[RAGModel] Found a similar query in Redis. Returning cached result.")
             return cached_resp
 
@@ -494,7 +512,10 @@ class RAGModel:
             print(doc_id)
             context_text += f"--- Document ID: {doc_id} ---\n{doc_content}\n\n"
 
-        # system and user prompts
+        # get the chat history from memory
+        chat_history = memory.buffer_as_str
+
+        # build the prompt with chat history and current query
         system_msg = (
             "You are a helpful AI assistant chatbot. You must follow these rules:\n"
             "1) Always cite document IDs from the context exactly as 'Document XYZ' without any file extensions like '.txt'.\n"
@@ -506,6 +527,7 @@ class RAGModel:
             # "7) Answer in at most 4 sentences.\n"
         )
         final_prompt = (
+            f"Chat History: {chat_history}\n\n"
             f"User Query:\n{query}\n\n"
             f"Context:\n{context_text}\n"
             "--- End of context ---\n\n"
@@ -518,6 +540,10 @@ class RAGModel:
         if not answer:
             return "Error: No response was generated. Please try later!"
 
+        # save the query and answer to memory
+        memory.save_context({"input": query}, {"output": answer})
+
+        # cache the resp
         lfu_cache_put(query_emb, answer)
         return answer
 
@@ -545,7 +571,7 @@ async def lifespan(app: FastAPI):
     global rag_model
     rag_model = RAGModel()
 
-    await rag_model.build_embeddings_from_scratch(PMC_DIR)
+    await rag_model.build_embeddings_from_scratch(EMB_DIR)
     print("[Lifespan] RAGModel is ready.")
     yield
     print("[Lifespan] Server is shutting down...")
@@ -566,6 +592,8 @@ async def ask_route(payload: dict = Body(...)):
     2) BlueHive generation
     3) Redis caching
     """
+    user_id = payload.get("user_id", "")
+    chat_id = payload.get("chat_id", "")
     query: str = payload.get("query", "")
     if not query.strip():
         return {"query": "", "answer": "[ERROR] Empty query."}
@@ -576,7 +604,7 @@ async def ask_route(payload: dict = Body(...)):
     if not rm:
         return {"error": "RAGModel not initialized"}
 
-    answer = await rm.ask(query, top_k)
+    answer = await rm.ask(query, chat_id, top_k)
     return {"query": query, "answer": answer}
 
 
