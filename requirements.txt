@@ -1,4 +1,4 @@
-numpy
+numpy<2
 fastapi
 uvicorn[standard]
 redis
@@ -14,4 +14,4 @@ sentence-transformers>=2.2.2
 langchain  # core LangChain lib
 langchain-community  # community extensions for LangChain
 langchain-openai  # openAI-specific LangChain integration
-spacy  # NER
+spacy
